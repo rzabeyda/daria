@@ -215,6 +215,7 @@ def _row_to_booking(row) -> dict:
         "year": row[3], "month": row[4], "day": row[5],
         "time": row[6], "name": row[7], "phone": row[8],
         "reminded_24": row[9], "reminded_2": row[10],
+        "review_sent": row[11] if len(row) > 11 else 0,
     }
 
 
@@ -244,13 +245,25 @@ def log_transfer(bid: int, user_id: int, service: str,
     con.commit(); con.close()
 
 
-def add_review(booking_id: int, user_id: int, service: str, rating: int, text: str):
+def add_review(booking_id: int, user_id: int, service: str, rating: int, text: str) -> int:
     con = db_connect()
-    con.execute(
+    cur = con.execute(
         "INSERT INTO reviews (booking_id,user_id,service,rating,text,created_at) VALUES (?,?,?,?,?,?)",
         (booking_id, user_id, service, rating, text, datetime.now().strftime("%Y-%m-%d %H:%M"))
     )
+    rid = cur.lastrowid
     con.commit(); con.close()
+    return rid
+
+
+def get_service_price_int(service_name: str) -> int:
+    """Возвращает цену услуги в евро как число (например 25)."""
+    svc = get_service(service_name)
+    if not svc:
+        return 0
+    import re
+    m = re.search(r"(\d+)", svc["price"])
+    return int(m.group(1)) if m else 0
 
 
 def get_stats() -> dict:
@@ -262,11 +275,33 @@ def get_stats() -> dict:
     stats["total_reviews"]   = con.execute("SELECT COUNT(*) FROM reviews").fetchone()[0]
     avg = con.execute("SELECT AVG(rating) FROM reviews").fetchone()[0]
     stats["avg_rating"]      = round(avg, 1) if avg else 0
+
     # по услугам
     rows = con.execute(
         "SELECT service, COUNT(*) as cnt FROM bookings GROUP BY service ORDER BY cnt DESC"
     ).fetchall()
     stats["by_service"] = rows
+
+    # ── Прибыль: активные брони ──────────────────────────────────────────────
+    active_rows = con.execute("SELECT service FROM bookings").fetchall()
+    total_revenue = sum(get_service_price_int(r[0]) for r in active_rows)
+    stats["total_revenue"] = total_revenue
+
+    # Прибыль по услугам (активные)
+    revenue_by_service = {}
+    for (svc_name, cnt) in rows:
+        price = get_service_price_int(svc_name)
+        revenue_by_service[svc_name] = price * cnt
+    stats["revenue_by_service"] = revenue_by_service
+
+    # Прибыль за текущий месяц
+    now = datetime.now()
+    month_rows = con.execute(
+        "SELECT service FROM bookings WHERE year=? AND month=?",
+        (now.year, now.month)
+    ).fetchall()
+    stats["month_revenue"] = sum(get_service_price_int(r[0]) for r in month_rows)
+
     # отмены по инициатору
     stats["cancelled_by_client"] = con.execute(
         "SELECT COUNT(*) FROM cancelled WHERE cancelled_by='client'"
@@ -274,6 +309,7 @@ def get_stats() -> dict:
     stats["cancelled_by_master"] = con.execute(
         "SELECT COUNT(*) FROM cancelled WHERE cancelled_by='master'"
     ).fetchone()[0]
+
     # последние отзывы
     stats["last_reviews"] = con.execute(
         "SELECT rating, text, service, created_at FROM reviews ORDER BY id DESC LIMIT 5"
@@ -283,12 +319,8 @@ def get_stats() -> dict:
 
 
 def get_client_visits(user_id: int) -> int:
-    """Общее количество визитов клиента (активные + отменённые мастером учитываются, отменённые клиентом нет)."""
     con = db_connect()
     active = con.execute("SELECT COUNT(*) FROM bookings WHERE user_id=?", (user_id,)).fetchone()[0]
-    # Из cancelled считаем только завершённые (отменённые мастером не считаем — клиент не пришёл)
-    # Считаем только из таблицы cancelled где cancelled_by='client' — нет, лучше только active+завершённые
-    # Простой вариант: все активные брони + все отменённые клиентом (раз уж дошёл до отмены — значит ходил)
     con.close()
     return active
 
@@ -455,7 +487,6 @@ def get_end_time(start_slot: str, duration_minutes: int) -> str:
 
 def get_busy_slots(year: int, month: int, day: int,
                    exclude_bid: int | None = None) -> set[str]:
-    """Слоты занятые существующими бронями (с учётом длительности)."""
     busy_minutes = set()
     for b in get_all_bookings():
         if exclude_bid and b["id"] == exclude_bid:
@@ -466,10 +497,8 @@ def get_busy_slots(year: int, month: int, day: int,
         dur = duration_minutes(svc)
         h, m = int(b["time"].split(":")[0]), int(b["time"].split(":")[1])
         start = h * 60 + m
-        # Помечаем все минуты занятые этой бронью
         for minute in range(start, start + dur):
             busy_minutes.add(minute)
-    # Переводим в слоты
     busy = set()
     for slot in TIME_SLOTS:
         h, m = int(slot.split(":")[0]), int(slot.split(":")[1])
@@ -481,10 +510,6 @@ def get_busy_slots(year: int, month: int, day: int,
 def get_available_slots(year: int, month: int, day: int,
                         new_dur_min: int = 60,
                         exclude_bid: int | None = None) -> list[str]:
-    """
-    Базовые слоты каждый час (09:00..18:00).
-    Добавляем HH:30 если бронь заканчивается в HH:30 — туда влезает новая услуга.
-    """
     now = datetime.now()
     key = date_key(year, month, day)
     manual_blocked_min = set()
@@ -492,7 +517,6 @@ def get_available_slots(year: int, month: int, day: int,
         h, m = int(slot.split(":")[0]), int(slot.split(":")[1])
         manual_blocked_min.add(h * 60 + m)
 
-    # Собираем занятые интервалы
     booked_intervals = []
     for b in get_all_bookings():
         if exclude_bid and b["id"] == exclude_bid:
@@ -516,15 +540,12 @@ def get_available_slots(year: int, month: int, day: int,
             return False
         return True
 
-    # Базовые почасовые кандидаты 09:00..18:00
     candidates = list(range(9 * 60, 18 * 60 + 1, 60))
 
-    # Добавляем HH:30 после брони заканчивающейся на :30
     for _, be in booked_intervals:
         if be % 60 == 30 and 9 * 60 <= be <= 18 * 60:
             candidates.append(be)
 
-    # Сегодня: убираем прошедшее
     if year == now.year and month == now.month and day == now.day:
         cutoff = now.hour * 60 + now.minute
         candidates = [m for m in candidates if m > cutoff]
@@ -535,7 +556,6 @@ def get_available_slots(year: int, month: int, day: int,
 
 def get_blocked_slots(year: int, month: int, day: int, exclude_bid: int | None = None,
                       new_duration_slots: int = 1) -> set[str]:
-    """Возвращает недоступные слоты (для совместимости со старым кодом)."""
     new_dur_min = new_duration_slots * 30
     available = set(get_available_slots(year, month, day, new_dur_min, exclude_bid))
     all_candidates = set(TIME_SLOTS)
@@ -1353,6 +1373,8 @@ async def admin_actions(call: types.CallbackQuery, state: FSMContext):
         except Exception as e:
             await call.message.answer(f"❌ Ошибка статистики: {e}")
             await call.answer(); return
+
+        now = datetime.now()
         text = (
             f"📊 Статистика\n\n"
             f"📋 Активных броней: {s['total_active']}\n"
@@ -1363,16 +1385,27 @@ async def admin_actions(call: types.CallbackQuery, state: FSMContext):
         )
         if s["avg_rating"]:
             text += f" | Средняя оценка: {s['avg_rating']} ⭐"
+
+        # ── Прибыль ──────────────────────────────────────────────────────────
+        text += (
+            f"\n\n💰 Прибыль\n"
+            f"📅 За {MONTHS[now.month]}: {s['month_revenue']}€\n"
+            f"📊 Всего (активные брони): {s['total_revenue']}€"
+        )
+
         if s["by_service"]:
             text += "\n\n💅 По услугам:\n"
             for svc_name, cnt in s["by_service"]:
-                text += f"  • {svc_name}: {cnt}\n"
+                rev = s["revenue_by_service"].get(svc_name, 0)
+                text += f"  • {svc_name}: {cnt} шт. → {rev}€\n"
+
         if s["last_reviews"]:
             text += "\n⭐ Последние отзывы:\n"
             for rating, rev_text, svc_name, created_at in s["last_reviews"]:
                 stars = "⭐" * rating
                 rev   = f" — {rev_text}" if rev_text else ""
                 text += f"  {stars} {svc_name}{rev}\n"
+
         await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
         ]))
@@ -1575,12 +1608,13 @@ async def reminder_loop():
                     except Exception:
                         pass
 
-                # Запрос отзыва — через 60 мин после окончания услуги
+                # ── Запрос отзыва — через 3 часа после ОКОНЧАНИЯ услуги ────
                 svc_obj = get_service(b["service"])
                 dur_m   = duration_minutes(svc_obj)
                 end_appt = appt + timedelta(minutes=dur_m)
                 mins_after_end = (now - end_appt).total_seconds() / 60
-                if not b.get("review_sent") and 60 <= mins_after_end <= 80:
+                # Окно: 180–200 минут после окончания (было 60–80)
+                if not b.get("review_sent") and 180 <= mins_after_end <= 200:
                     try:
                         await bot.send_message(
                             b["user_id"],
@@ -1689,11 +1723,9 @@ async def reschedule_time(call: types.CallbackQuery, state: FSMContext):
     old_date = f"{b['year']}-{b['month']:02d}-{b['day']:02d}"
     new_date = f"{year}-{month:02d}-{day:02d}"
 
-    # Логируем перенос
     log_transfer(bid, b["user_id"], b["service"],
                  old_date, b["time"], new_date, new_time)
 
-    # Обновляем бронь
     update_booking_field(bid, "year",  year)
     update_booking_field(bid, "month", month)
     update_booking_field(bid, "day",   day)
@@ -1733,17 +1765,36 @@ async def review_rating(call: types.CallbackQuery, state: FSMContext):
     rating = int(rating_str)
     b      = get_booking(bid)
     svc    = b["service"] if b else ""
-    await state.update_data(review_bid=bid, review_rating=rating, review_service=svc)
-    stars  = "⭐" * rating
+
+    # Сохраняем оценку сразу — даже если клиент закроет бота после этого
+    review_id = add_review(bid, call.from_user.id, svc, rating, "")
+    await state.update_data(review_bid=bid, review_rating=rating,
+                            review_service=svc, review_id=review_id)
+
+    stars = "⭐" * rating
+    # Уведомляем мастера уже сейчас
+    for _aid in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                _aid,
+                f"⭐ Новый отзыв!\n\n💅 {svc}\n{stars}"
+            )
+        except Exception:
+            pass
+
     await call.message.answer(
-        f"Вы поставили {stars}\n\nНапишите отзыв (или отправьте /skip чтобы пропустить):"
+        f"Вы поставили {stars}\n\nНапишите комментарий (или нажмите «Пропустить»):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Пропустить", callback_data="rev_skip")
+        ]])
     )
     await state.set_state(Review.text)
     await call.answer()
 
 
 @dp.callback_query(F.data == "rev_skip")
-async def review_skip(call: types.CallbackQuery):
+async def review_skip(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
     await call.message.answer("Спасибо! Ждём вас снова 💅")
     await call.answer()
 
@@ -1751,26 +1802,33 @@ async def review_skip(call: types.CallbackQuery):
 @dp.message(Review.text)
 async def review_text(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    text = message.text if message.text != "/skip" else ""
-    add_review(data["review_bid"], message.from_user.id,
-               data["review_service"], data["review_rating"], text)
+    text = message.text.strip() if message.text and message.text != "/skip" else ""
+
+    # Обновляем текст в уже сохранённом отзыве
+    review_id = data.get("review_id")
+    if review_id and text:
+        con = db_connect()
+        con.execute("UPDATE reviews SET text=? WHERE id=?", (text, review_id))
+        con.commit(); con.close()
+
     stars = "⭐" * data["review_rating"]
     await message.answer("🙏 Спасибо за отзыв! Ждём вас снова 💅")
-    for _aid in ADMIN_IDS:
-        review_text = f"\n💬 {text}" if text else ""
-        await bot.send_message(
-            _aid,
-            f"⭐ Новый отзыв!\n\n"
-            f"💅 {data['review_service']}\n"
-            f"{stars}{review_text}"
-        )
+
+    if text:
+        for _aid in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    _aid,
+                    f"💬 Клиент добавил комментарий к отзыву:\n\n"
+                    f"💅 {data['review_service']}\n{stars}\n{text}"
+                )
+            except Exception:
+                pass
+
     await state.clear()
 
 
 # ─── Статистика ───────────────────────────────────────────────────────────────
-
-
-
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
@@ -1778,12 +1836,15 @@ async def cmd_stats(message: types.Message):
         return
     try:
         s = get_stats()
+        now = datetime.now()
         await message.answer(
             f"📊 Статистика\n\n"
             f"📋 Активных броней: {s['total_active']}\n"
             f"🗑 Отмен: {s['total_cancelled']} (клиент: {s['cancelled_by_client']}, мастер: {s['cancelled_by_master']})\n"
             f"🔄 Переносов: {s['total_transfers']}\n"
-            f"⭐ Отзывов: {s['total_reviews']}"
+            f"⭐ Отзывов: {s['total_reviews']}\n\n"
+            f"💰 За {MONTHS[now.month]}: {s['month_revenue']}€\n"
+            f"💰 Всего (активные): {s['total_revenue']}€"
         )
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
