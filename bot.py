@@ -78,6 +78,7 @@ def migrate_db():
     con = db_connect()
     for stmt in [
         "ALTER TABLE bookings ADD COLUMN review_sent INTEGER DEFAULT 0",
+        "ALTER TABLE reviews ADD COLUMN username TEXT DEFAULT ''",
         "ALTER TABLE services ADD COLUMN description TEXT DEFAULT ''",
     ]:
         try: con.execute(stmt); con.commit()
@@ -211,11 +212,11 @@ def log_transfer(bid, user_id, service, old_date, old_time, new_date, new_time):
         (bid,user_id,service,old_date,old_time,new_date,new_time,datetime.now().strftime("%Y-%m-%d %H:%M"))
     ); con.commit(); con.close()
 
-def add_review(booking_id, user_id, service, rating, text):
+def add_review(booking_id, user_id, service, rating, text, username=""):
     con = db_connect()
     cur = con.execute(
-        "INSERT INTO reviews (booking_id,user_id,service,rating,text,created_at) VALUES (?,?,?,?,?,?)",
-        (booking_id,user_id,service,rating,text,datetime.now().strftime("%Y-%m-%d %H:%M"))
+        "INSERT INTO reviews (booking_id,user_id,service,rating,text,created_at,username) VALUES (?,?,?,?,?,?,?)",
+        (booking_id,user_id,service,rating,text,datetime.now().strftime("%Y-%m-%d %H:%M"),username)
     ); rid = cur.lastrowid; con.commit(); con.close(); return rid
 
 def get_service_price_int(service_name):
@@ -298,6 +299,12 @@ class Reschedule(StatesGroup):
 class Review(StatesGroup):
     rating=State(); text=State()
 
+class TipState(StatesGroup):
+    amount = State()
+
+class AdminReview(StatesGroup):
+    text=State(); add_text=State(); add_rating=State(); add_service=State()
+
 class AddService(StatesGroup):
     name=State(); price=State(); duration=State(); img=State()
 
@@ -353,8 +360,9 @@ def format_booking(b, idx=None, username=None):
     return f"{prefix}💅 {b['service']}\n⏱ Длительность: ~{dur_str}\n🕐 {b['time']} | {b['day']} {month_name}\n👤 {b['name']} 📞 {b['phone']}{tg_line}{addr}".strip()
 
 def bottom_kb(is_admin=False):
-    row = [KeyboardButton(text="💅 Услуги"), KeyboardButton(text="📋 Мои брони"), KeyboardButton(text="📞 Контакты")]
-    buttons = [row]
+    row1 = [KeyboardButton(text="💅 Услуги"), KeyboardButton(text="📋 Мои брони"), KeyboardButton(text="⭐ Отзывы")]
+    row2 = [KeyboardButton(text="💝 Чаевые"), KeyboardButton(text="👭 Друзья"), KeyboardButton(text="📞 Контакты")]
+    buttons = [row1, row2]
     if is_admin: buttons.append([KeyboardButton(text="🔐 Админка")])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
@@ -448,7 +456,8 @@ def admin_panel_kb():
         [InlineKeyboardButton(text="🔜 Брони на завтра",     callback_data="admin_tomorrow")],
         [InlineKeyboardButton(text="🗓 Моё расписание",      callback_data="admin_schedule")],
         [InlineKeyboardButton(text="📊 Статистика",          callback_data="admin_stats")],
-        [InlineKeyboardButton(text="💅 Управление услугами", callback_data="admin_services")]])
+        [InlineKeyboardButton(text="💅 Управление услугами", callback_data="admin_services")],
+        [InlineKeyboardButton(text="⭐ Управление отзывами", callback_data="admin_reviews")]])
 
 def admin_services_kb():
     rows = []
@@ -547,9 +556,84 @@ async def btn_my_bookings(message: types.Message, state: FSMContext):
         await message.answer("У вас нет активных броней."); return
     await message.answer("📋 Ваши брони:", reply_markup=booking_list_kb(message.from_user.id))
 
+@dp.message(F.text == "⭐ Отзывы")
+async def btn_reviews(message: types.Message):
+    con = db_connect()
+    rows = con.execute(
+        "SELECT rating, text, service, created_at, username FROM reviews ORDER BY id DESC LIMIT 20"
+    ).fetchall()
+    con.close()
+    if not rows:
+        await message.answer("😊 Отзывов пока нет — будьте первым!")
+        return
+    text = "⭐ Отзывы клиентов:\n\n"
+    for row in rows:
+        rating, rv, svc_name, created_at = row[0], row[1], row[2], row[3]
+        username = row[4] if len(row) > 4 and row[4] else "Аноним"
+        stars = "⭐" * rating
+        date_str = created_at[:10] if created_at else ""
+        text += f"{stars} — {svc_name} ({date_str})\n"
+        text += f"👤 {username}\n"
+        if rv:
+            text += f"💬 {rv}"
+        text += "\n\n"
+    await message.answer(text.strip())
+
 @dp.message(F.text == "📞 Контакты")
 async def btn_contacts(message: types.Message):
     await message.answer("📇 Контакты мастера:\n\n" + CONTACTS_FULL)
+
+@dp.message(F.text == "👭 Друзья")
+async def btn_partners(message: types.Message):
+    await message.answer(
+        "👭 Партнёры Дарьи\n\n"
+        "Здесь скоро появятся наши проверенные партнёры — мастера и салоны, которым мы доверяем 💅\n\n"
+        "Следите за обновлениями!"
+    )
+
+@dp.message(F.text == "💝 Чаевые")
+async def btn_tips(message: types.Message, state: FSMContext):
+    await message.answer("🚧 В разработке!")
+
+@dp.callback_query(F.data == "tip_cancel")
+async def tip_cancel(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.answer("Отменено.")
+    await call.answer()
+
+@dp.message(TipState.amount)
+async def tip_amount(message: types.Message, state: FSMContext):
+    await state.clear()
+    if not message.text or not message.text.strip().isdigit():
+        await message.answer("⚠️ Введите целое число, например: 10")
+        await state.set_state(TipState.amount)
+        return
+    amount = int(message.text.strip())
+    if amount < 1:
+        await message.answer("⚠️ Минимальная сумма — 1 ⭐")
+        await state.set_state(TipState.amount)
+        return
+    await state.clear()
+    await message.answer_invoice(
+        title="💝 Чаевые мастеру",
+        description=f"Спасибо за визит! Вы отправляете {amount} ⭐ Дарье",
+        payload="tip",
+        currency="XTR",
+        prices=[{"label": "Чаевые", "amount": amount}]
+    )
+
+@dp.pre_checkout_query()
+async def pre_checkout(query: types.PreCheckoutQuery):
+    await query.answer(ok=True)
+
+@dp.message(F.successful_payment)
+async def successful_payment(message: types.Message):
+    stars = message.successful_payment.total_amount
+    await message.answer(f"🙏 Спасибо за {stars} ⭐! Дарья очень рада 💅")
+    for _aid in ADMIN_IDS:
+        try:
+            await bot.send_message(_aid, f"💝 Новые чаевые! {stars} ⭐ от @{message.from_user.username or message.from_user.first_name}")
+        except: pass
 
 @dp.message(F.text == "🔐 Админка")
 async def btn_admin_panel(message: types.Message):
@@ -818,6 +902,48 @@ async def admin_actions(call: types.CallbackQuery):
             for rating,rv,svc_name,_ in s["last_reviews"]:
                 text+=f"  {'⭐'*rating} {svc_name}{(' — '+rv) if rv else ''}\n"
         await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]]))
+    elif action=="admin_reviews":
+        con=db_connect()
+        rows=con.execute("SELECT id,rating,text,service,created_at,username FROM reviews ORDER BY id DESC LIMIT 30").fetchall()
+        con.close()
+        if not rows:
+            await call.message.answer("⭐ Отзывов пока нет.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✍️ Написать отзыв", callback_data="admin_rev_add")],
+                    [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]]))
+            await call.answer(); return
+        text="⭐ Все отзывы:\n\n"
+        kb_rows=[]
+        for row in rows:
+            rev_id,rating,rv,svc_name,created_at = row[0],row[1],row[2],row[3],row[4]
+            username = row[5] if len(row) > 5 and row[5] else "Аноним"
+            stars="⭐"*rating
+            date_str=created_at[:10] if created_at else ""
+            text+=f"#{rev_id} {stars} — {svc_name} ({date_str})\n"
+            text+=f"👤 {username}\n"
+            if rv: text+=f"💬 {rv}\n"
+            text+="\n"
+            kb_rows.append([
+                InlineKeyboardButton(text=f"✏️ #{rev_id}", callback_data=f"admin_rev_edit:{rev_id}"),
+                InlineKeyboardButton(text=f"🗑 #{rev_id}", callback_data=f"admin_rev_del:{rev_id}")])
+        kb_rows.append([InlineKeyboardButton(text="✍️ Написать отзыв", callback_data="admin_rev_add")])
+        kb_rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")])
+        await call.message.answer(text.strip(), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    elif action.startswith("admin_rev_del:"):
+        rev_id=int(action.split(":")[1])
+        con=db_connect(); con.execute("DELETE FROM reviews WHERE id=?", (rev_id,)); con.commit(); con.close()
+        await call.message.answer("🗑 Отзыв удалён.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ К отзывам", callback_data="admin_reviews")]]))
+    elif action.startswith("admin_rev_edit:"):
+        rev_id=int(action.split(":")[1])
+        await state.update_data(edit_rev_id=rev_id)
+        await state.set_state(AdminReview.text)
+        await call.message.answer("✏️ Введите новый текст отзыва (или /skip чтобы оставить без текста):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_reviews")]]))
+    elif action=="admin_rev_add":
+        await state.set_state(AdminReview.add_text)
+        await call.message.answer("✍️ Введите текст отзыва от мастера:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_reviews")]]))
     elif action=="admin_back":
         await call.message.answer(f"🔐 Панель администратора\nВсего броней: {len(get_all_bookings())}", reply_markup=admin_panel_kb())
     elif action.startswith("admin_del:"):
@@ -1068,7 +1194,8 @@ def review_rating_kb(bid):
 async def review_rating(call: types.CallbackQuery, state: FSMContext):
     _,bid_str,rating_str=call.data.split(":"); bid=int(bid_str); rating=int(rating_str)
     b=get_booking(bid); svc=b["service"] if b else ""
-    review_id=add_review(bid,call.from_user.id,svc,rating,"")
+    username = call.from_user.username or call.from_user.first_name or "Аноним"
+    review_id=add_review(bid,call.from_user.id,svc,rating,"",username)
     await state.update_data(review_bid=bid,review_rating=rating,review_service=svc,review_id=review_id)
     stars="⭐"*rating
     for _aid in ADMIN_IDS:
@@ -1095,6 +1222,53 @@ async def review_text(message: types.Message, state: FSMContext):
             try: await bot.send_message(_aid, f"💬 Комментарий к отзыву:\n\n💅 {data['review_service']}\n{stars}\n{text}")
             except: pass
     await state.clear()
+
+@dp.message(AdminReview.text)
+async def admin_rev_edit_text(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    rev_id = data.get("edit_rev_id")
+    new_text = "" if (not message.text or message.text == "/skip") else message.text.strip()
+    con = db_connect()
+    con.execute("UPDATE reviews SET text=? WHERE id=?", (new_text, rev_id))
+    con.commit(); con.close()
+    await state.clear()
+    await message.answer("✅ Отзыв обновлён!", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ К отзывам", callback_data="admin_reviews")]]))
+
+@dp.message(AdminReview.add_text)
+async def admin_rev_add_text(message: types.Message, state: FSMContext):
+    await state.update_data(new_rev_text=message.text.strip() if message.text else "")
+    await state.set_state(AdminReview.add_rating)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=s, callback_data=f"admin_rev_rating:{i+1}")]
+        for i, s in enumerate(["⭐","⭐⭐","⭐⭐⭐","⭐⭐⭐⭐","⭐⭐⭐⭐⭐"])])
+    await message.answer("Выберите рейтинг:", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("admin_rev_rating:"), AdminReview.add_rating)
+async def admin_rev_add_rating(call: types.CallbackQuery, state: FSMContext):
+    rating = int(call.data.split(":")[1])
+    await state.update_data(new_rev_rating=rating)
+    await state.set_state(AdminReview.add_service)
+    services = get_all_services_db()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=s["name"], callback_data=f"admin_rev_svc:{s['name']}")]
+        for s in services])
+    await call.message.answer("Выберите услугу для отзыва:", reply_markup=kb)
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("admin_rev_svc:"), AdminReview.add_service)
+async def admin_rev_add_service(call: types.CallbackQuery, state: FSMContext):
+    svc_name = call.data.split(":", 1)[1]
+    data = await state.get_data()
+    con = db_connect()
+    con.execute(
+        "INSERT INTO reviews (booking_id, user_id, service, rating, text, created_at) VALUES (?,?,?,?,?,?)",
+        (0, 0, svc_name, data["new_rev_rating"], data.get("new_rev_text", ""), datetime.now().strftime("%Y-%m-%d %H:%M")))
+    con.commit(); con.close()
+    await state.clear()
+    await call.message.answer("✅ Отзыв добавлен!", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ К отзывам", callback_data="admin_reviews")]]))
+    await call.answer()
 
 async def reminder_loop():
     while True:
