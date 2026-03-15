@@ -69,6 +69,15 @@ def init_db():
             price TEXT NOT NULL, duration TEXT NOT NULL, duration_min INTEGER NOT NULL,
             img TEXT NOT NULL, sort_order INTEGER DEFAULT 0, active INTEGER DEFAULT 1, description TEXT DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS friends (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            specialty TEXT NOT NULL,
+            description TEXT NOT NULL,
+            link TEXT NOT NULL,
+            photo_id TEXT NOT NULL,
+            sort_order INTEGER DEFAULT 0
+        );
     """)
     con.commit(); con.close()
 
@@ -80,12 +89,48 @@ def migrate_db():
         "ALTER TABLE bookings ADD COLUMN review_sent INTEGER DEFAULT 0",
         "ALTER TABLE reviews ADD COLUMN username TEXT DEFAULT ''",
         "ALTER TABLE services ADD COLUMN description TEXT DEFAULT ''",
+        """CREATE TABLE IF NOT EXISTS friends (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            specialty TEXT NOT NULL,
+            description TEXT NOT NULL,
+            link TEXT NOT NULL,
+            photo_id TEXT NOT NULL,
+            sort_order INTEGER DEFAULT 0
+        )""",
     ]:
         try: con.execute(stmt); con.commit()
         except: pass
     con.close()
 
 migrate_db()
+
+# ── Friends DB helpers ────────────────────────────────────────────────────────
+def get_all_friends():
+    con = db_connect()
+    rows = con.execute("SELECT * FROM friends ORDER BY sort_order, id").fetchall()
+    con.close()
+    cols = ["id","name","specialty","description","link","photo_id","sort_order"]
+    return [dict(zip(cols, r)) for r in rows]
+
+def get_friend(fid):
+    con = db_connect()
+    row = con.execute("SELECT * FROM friends WHERE id=?", (fid,)).fetchone()
+    con.close()
+    if not row: return None
+    return dict(zip(["id","name","specialty","description","link","photo_id","sort_order"], row))
+
+def add_friend(name, specialty, description, link, photo_id):
+    con = db_connect()
+    con.execute("INSERT INTO friends (name,specialty,description,link,photo_id) VALUES (?,?,?,?,?)",
+                (name, specialty, description, link, photo_id))
+    con.commit(); con.close()
+
+def delete_friend(fid):
+    con = db_connect()
+    con.execute("DELETE FROM friends WHERE id=?", (fid,))
+    con.commit(); con.close()
+# ─────────────────────────────────────────────────────────────────────────────
 
 _DEFAULT_SERVICES = [
     ("Классический маникюр", "15€", "30 мин",  30,  "images/1.jpg", 1),
@@ -302,6 +347,9 @@ class Review(StatesGroup):
 class TipState(StatesGroup):
     amount = State()
 
+class TipCustom(StatesGroup):
+    amount = State()
+
 class AdminReview(StatesGroup):
     text=State(); add_text=State(); add_rating=State(); add_service=State()
 
@@ -310,6 +358,9 @@ class AddService(StatesGroup):
 
 class EditService(StatesGroup):
     value=State(); img=State()
+
+class AddFriend(StatesGroup):
+    photo=State(); name=State(); specialty=State(); description=State(); link=State()
 
 def date_key(year, month, day): return f"{year}-{month:02d}-{day:02d}"
 def is_day_blocked(year, month, day): return date_key(year,month,day) in get_blocked_days()
@@ -360,8 +411,8 @@ def format_booking(b, idx=None, username=None):
     return f"{prefix}💅 {b['service']}\n⏱ Длительность: ~{dur_str}\n🕐 {b['time']} | {b['day']} {month_name}\n👤 {b['name']} 📞 {b['phone']}{tg_line}{addr}".strip()
 
 def bottom_kb(is_admin=False):
-    row1 = [KeyboardButton(text="💅 Услуги"), KeyboardButton(text="📋 Мои брони"), KeyboardButton(text="⭐ Отзывы")]
-    row2 = [KeyboardButton(text="💝 Чаевые"), KeyboardButton(text="👭 Друзья"), KeyboardButton(text="📞 Контакты")]
+    row1 = [KeyboardButton(text="💅 Услуги"), KeyboardButton(text="📋 Мои брони"), KeyboardButton(text="🖼 Портфолио")]
+    row2 = [KeyboardButton(text="💬 Чат"), KeyboardButton(text="💅 Мастера"), KeyboardButton(text="⭐ Отзывы")]
     buttons = [row1, row2]
     if is_admin: buttons.append([KeyboardButton(text="🔐 Админка")])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
@@ -457,7 +508,23 @@ def admin_panel_kb():
         [InlineKeyboardButton(text="🗓 Моё расписание",      callback_data="admin_schedule")],
         [InlineKeyboardButton(text="📊 Статистика",          callback_data="admin_stats")],
         [InlineKeyboardButton(text="💅 Управление услугами", callback_data="admin_services")],
-        [InlineKeyboardButton(text="⭐ Управление отзывами", callback_data="admin_reviews")]])
+        [InlineKeyboardButton(text="⭐ Управление отзывами", callback_data="admin_reviews")],
+        [InlineKeyboardButton(text="💅 Управление мастерами", callback_data="admin_masters")]])
+
+def admin_friends_kb():
+    rows = []
+    for f in get_all_friends():
+        rows.append([InlineKeyboardButton(
+            text=f"👤 {f['name']} — {f['specialty']}",
+            callback_data=f"friend_manage:{f['id']}")])
+    rows.append([InlineKeyboardButton(text="➕ Добавить друга", callback_data="friend_add")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад",          callback_data="admin_back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def friend_manage_kb(fid):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить",  callback_data=f"friend_delete:{fid}")],
+        [InlineKeyboardButton(text="◀️ Назад",    callback_data="admin_masters")]])
 
 def admin_services_kb():
     rows = []
@@ -570,6 +637,8 @@ async def btn_reviews(message: types.Message):
     for row in rows:
         rating, rv, svc_name, created_at = row[0], row[1], row[2], row[3]
         username = row[4] if len(row) > 4 and row[4] else "Аноним"
+        if username != "Аноним" and not username.startswith("@"):
+            username = "@" + username
         stars = "⭐" * rating
         date_str = created_at[:10] if created_at else ""
         text += f"{stars} — {svc_name} ({date_str})\n"
@@ -579,45 +648,105 @@ async def btn_reviews(message: types.Message):
         text += "\n\n"
     await message.answer(text.strip())
 
-@dp.message(F.text == "📞 Контакты")
-async def btn_contacts(message: types.Message):
-    await message.answer("📇 Контакты мастера:\n\n" + CONTACTS_FULL)
+@dp.message(F.text == "💅 Мастера")
+async def btn_friends(message: types.Message):
+    friends = get_all_friends()
+    if not friends:
+        await message.answer("👯 Пока друзей нет — скоро добавим! 💅")
+        return
+    rows = []
+    for f in friends:
+        rows.append([InlineKeyboardButton(text=f"👤 {f['name']} — {f['specialty']}", callback_data=f"friend_view:{f['id']}")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    await message.answer("💅 Мастера красоты\n\nВыберите мастера 👇", reply_markup=kb)
 
-@dp.message(F.text == "👭 Друзья")
-async def btn_partners(message: types.Message):
-    await message.answer(
-        "👭 Партнёры Дарьи\n\n"
-        "Здесь скоро появятся наши проверенные партнёры — мастера и салоны, которым мы доверяем 💅\n\n"
-        "Следите за обновлениями!"
-    )
-
-@dp.message(F.text == "💝 Чаевые")
-async def btn_tips(message: types.Message, state: FSMContext):
-    await message.answer("🚧 В разработке!")
-
-@dp.callback_query(F.data == "tip_cancel")
-async def tip_cancel(call: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await call.message.answer("Отменено.")
+@dp.callback_query(F.data.startswith("friend_view:"))
+async def friend_view(call: types.CallbackQuery):
+    fid = int(call.data.split(":")[1])
+    f = get_friend(fid)
+    if not f:
+        await call.answer("Не найдено", show_alert=True); return
+    caption = f"👤 *{f['name']}*\n💼 {f['specialty']}\n\n{f['description']}\n\n🔗 {f['link']}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="masters_back")]])
+    await call.message.answer_photo(photo=f['photo_id'], caption=caption, parse_mode="Markdown", reply_markup=kb)
     await call.answer()
 
-@dp.message(TipState.amount)
-async def tip_amount(message: types.Message, state: FSMContext):
-    await state.clear()
-    if not message.text or not message.text.strip().isdigit():
-        await message.answer("⚠️ Введите целое число, например: 10")
-        await state.set_state(TipState.amount)
+@dp.callback_query(F.data == "masters_back")
+async def friends_back(call: types.CallbackQuery):
+    friends = get_all_friends()
+    rows = []
+    for f in friends:
+        rows.append([InlineKeyboardButton(text=f"👤 {f['name']} — {f['specialty']}", callback_data=f"friend_view:{f['id']}")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    await call.message.answer("💅 Мастера красоты\n\nВыберите мастера 👇", reply_markup=kb)
+    await call.answer()
+
+@dp.message(F.text == "🖼 Портфолио")
+async def btn_portfolio(message: types.Message):
+    portfolio_files = [f"images/{i}.jpg" for i in range(86, 100)]
+    existing = [f for f in portfolio_files if os.path.exists(f)]
+    if not existing:
+        await message.answer("🖼 Портфолио пока пустое — скоро добавим работы! 💅")
         return
+    chunk_size = 10
+    for i in range(0, len(existing), chunk_size):
+        chunk = existing[i:i + chunk_size]
+        media = [types.InputMediaPhoto(media=FSInputFile(path)) for path in chunk]
+        await message.answer_media_group(media=media)
+
+@dp.message(F.text == "💬 Чат")
+async def btn_chat(message: types.Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Открыть чат", url="https://t.me/beautytallinn")]])
+    await message.answer("👇", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("tip_open:"))
+async def tip_open(call: types.CallbackQuery):
+    bid = int(call.data.split(":")[1])
+    await call.message.answer("💝 Выберите сумму чаевых:", reply_markup=tip_amounts_kb(bid))
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("tip_send:"))
+async def tip_send(call: types.CallbackQuery):
+    parts = call.data.split(":")
+    bid, amount = int(parts[1]), int(parts[2])
+    await call.message.answer_invoice(
+        title="💝 Чаевые мастеру",
+        description=" ",
+        payload=f"tip:{bid}",
+        currency="XTR",
+        prices=[{"label": "Чаевые", "amount": amount}]
+    )
+    await call.answer()
+
+@dp.callback_query(F.data == "tip_close")
+async def tip_close(call: types.CallbackQuery):
+    await call.message.delete()
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("tip_custom:"))
+async def tip_custom_start(call: types.CallbackQuery, state: FSMContext):
+    bid = int(call.data.split(":")[1])
+    await state.update_data(tip_bid=bid)
+    await state.set_state(TipCustom.amount)
+    await call.message.answer("✏️ Введите количество звёзд (минимум 1):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="tip_close")]]))
+    await call.answer()
+
+@dp.message(TipCustom.amount)
+async def tip_custom_amount(message: types.Message, state: FSMContext):
+    if not message.text or not message.text.strip().isdigit() or int(message.text.strip()) < 1:
+        await message.answer("⚠️ Введите целое число, минимум 1")
+        return
+    data = await state.get_data()
     amount = int(message.text.strip())
-    if amount < 1:
-        await message.answer("⚠️ Минимальная сумма — 1 ⭐")
-        await state.set_state(TipState.amount)
-        return
+    bid = data.get("tip_bid", 0)
     await state.clear()
     await message.answer_invoice(
         title="💝 Чаевые мастеру",
-        description=f"Спасибо за визит! Вы отправляете {amount} ⭐ Дарье",
-        payload="tip",
+        description=" ",
+        payload=f"tip:{bid}",
         currency="XTR",
         prices=[{"label": "Чаевые", "amount": amount}]
     )
@@ -917,6 +1046,8 @@ async def admin_actions(call: types.CallbackQuery):
         for row in rows:
             rev_id,rating,rv,svc_name,created_at = row[0],row[1],row[2],row[3],row[4]
             username = row[5] if len(row) > 5 and row[5] else "Аноним"
+            if username != "Аноним" and not username.startswith("@"):
+                username = "@" + username
             stars="⭐"*rating
             date_str=created_at[:10] if created_at else ""
             text+=f"#{rev_id} {stars} — {svc_name} ({date_str})\n"
@@ -944,6 +1075,8 @@ async def admin_actions(call: types.CallbackQuery):
         await state.set_state(AdminReview.add_text)
         await call.message.answer("✍️ Введите текст отзыва от мастера:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_reviews")]]))
+    elif action=="admin_masters":
+        await call.message.answer("💅 Управление мастерами:", reply_markup=admin_friends_kb())
     elif action=="admin_back":
         await call.message.answer(f"🔐 Панель администратора\nВсего броней: {len(get_all_bookings())}", reply_markup=admin_panel_kb())
     elif action.startswith("admin_del:"):
@@ -955,6 +1088,72 @@ async def admin_actions(call: types.CallbackQuery):
             await call.message.answer("✅ Бронь отменена.")
         else: await call.message.answer("Бронь не найдена.")
     await call.answer()
+
+# ── Friends admin handlers ────────────────────────────────────────────────────
+@dp.callback_query(F.data.startswith("friend_manage:"))
+async def friend_manage(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS: await call.answer("⛔️", show_alert=True); return
+    fid = int(call.data.split(":")[1])
+    f = get_friend(fid)
+    if not f: await call.answer("Не найдено", show_alert=True); return
+    text = f"👤 {f['name']} — {f['specialty']}\n\n{f['description']}\n\n🔗 {f['link']}"
+    await call.message.answer_photo(photo=f['photo_id'], caption=text, reply_markup=friend_manage_kb(fid))
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("friend_delete:"))
+async def friend_delete(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS: await call.answer("⛔️", show_alert=True); return
+    fid = int(call.data.split(":")[1])
+    delete_friend(fid)
+    await call.message.answer("✅ Друг удалён.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ К списку", callback_data="admin_masters")]]))
+    await call.answer()
+
+@dp.callback_query(F.data == "friend_add")
+async def friend_add_start(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id not in ADMIN_IDS: await call.answer("⛔️", show_alert=True); return
+    await state.set_state(AddFriend.photo)
+    await call.message.answer("📸 Отправьте фото мастера:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_masters")]]))
+    await call.answer()
+
+@dp.message(AddFriend.photo, F.photo)
+async def friend_add_photo(message: types.Message, state: FSMContext):
+    photo_id = message.photo[-1].file_id
+    await state.update_data(photo_id=photo_id)
+    await state.set_state(AddFriend.name)
+    await message.answer("✍️ Введите имя мастера (например: Анна):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_masters")]]))
+
+@dp.message(AddFriend.name)
+async def friend_add_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await state.set_state(AddFriend.specialty)
+    await message.answer("💼 Введите специализацию (например: мастер по губам):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_masters")]]))
+
+@dp.message(AddFriend.specialty)
+async def friend_add_specialty(message: types.Message, state: FSMContext):
+    await state.update_data(specialty=message.text.strip())
+    await state.set_state(AddFriend.description)
+    await message.answer("📝 Введите описание мастера (кратко о работах, стиле):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_masters")]]))
+
+@dp.message(AddFriend.description)
+async def friend_add_description(message: types.Message, state: FSMContext):
+    await state.update_data(description=message.text.strip())
+    await state.set_state(AddFriend.link)
+    await message.answer("🔗 Введите ссылку на бота или сайт (например: https://t.me/username):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_masters")]]))
+
+@dp.message(AddFriend.link)
+async def friend_add_link(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+    add_friend(data['name'], data['specialty'], data['description'], message.text.strip(), data['photo_id'])
+    await message.answer(f"✅ Мастер {data['name']} добавлен в список друзей! 👯",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ К списку", callback_data="admin_masters")]]))
+# ─────────────────────────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data.startswith("svc_manage:"))
 async def svc_manage(call: types.CallbackQuery):
@@ -1184,9 +1383,20 @@ async def reschedule_time(call: types.CallbackQuery, state: FSMContext):
         except: pass
     await state.clear(); await call.answer()
 
+def tip_amounts_kb(bid):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1 ⭐", callback_data=f"tip_send:{bid}:1"),
+         InlineKeyboardButton(text="100 ⭐", callback_data=f"tip_send:{bid}:100")],
+        [InlineKeyboardButton(text="300 ⭐", callback_data=f"tip_send:{bid}:300"),
+         InlineKeyboardButton(text="500 ⭐", callback_data=f"tip_send:{bid}:500")],
+        [InlineKeyboardButton(text="1000 ⭐", callback_data=f"tip_send:{bid}:1000"),
+         InlineKeyboardButton(text="✏️ Своя сумма", callback_data=f"tip_custom:{bid}")],
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data="tip_close")]])
+
 def review_rating_kb(bid):
     stars=["⭐","⭐⭐","⭐⭐⭐","⭐⭐⭐⭐","⭐⭐⭐⭐⭐"]
     rows=[[InlineKeyboardButton(text=s, callback_data=f"rev_rating:{bid}:{i+1}")] for i,s in enumerate(stars)]
+    rows.append([InlineKeyboardButton(text="💝 Чаевые мастеру", callback_data=f"tip_open:{bid}")])
     rows.append([InlineKeyboardButton(text="❌ Пропустить", callback_data="rev_skip")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1292,7 +1502,7 @@ async def reminder_loop():
                     except: pass
                 svc_obj=get_service(b["service"]); dur_m=duration_minutes(svc_obj)
                 end_appt=appt+timedelta(minutes=dur_m); mins_after=(now-end_appt).total_seconds()/60
-                if not b.get("review_sent") and 180<=mins_after<=200:
+                if not b.get("review_sent") and 15<=mins_after<=35:
                     try:
                         await bot.send_message(b["user_id"], f"😊 Как прошёл визит?\n\n💅 {b['service']}\n\nОставьте оценку 👇", reply_markup=review_rating_kb(b["id"]))
                         con2=db_connect(); con2.execute("UPDATE bookings SET review_sent=1 WHERE id=?", (b["id"],)); con2.commit(); con2.close()
@@ -1317,6 +1527,16 @@ async def cmd_stats(message: types.Message):
         s=get_stats(); now=datetime.now()
         await message.answer(f"📊 Статистика\n\n📋 Активных: {s['total_active']}\n🗑 Отмен: {s['total_cancelled']}\n🔄 Переносов: {s['total_transfers']}\n⭐ Отзывов: {s['total_reviews']}\n\n💰 За {MONTHS[now.month]}: {s['month_revenue']}€\n💰 Всего: {s['total_revenue']}€")
     except Exception as e: await message.answer(f"❌ Ошибка: {e}")
+
+@dp.message(Command("tip"))
+async def cmd_tip(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("\u26d4\ufe0f \u041d\u0435\u0442 \u0434\u043e\u0441\u0442\u0443\u043f\u0430.")
+        return
+    await message.answer(
+        "\U0001f60a \u041a\u0430\u043a \u043f\u0440\u043e\u0448\u0451\u043b \u0432\u0438\u0437\u0438\u0442?\n\n\U0001f485 \u0422\u0435\u0441\u0442\u043e\u0432\u0430\u044f \u0443\u0441\u043b\u0443\u0433\u0430\n\n\u041e\u0441\u0442\u0430\u0432\u044c\u0442\u0435 \u043e\u0446\u0435\u043d\u043a\u0443 \U0001f447",
+        reply_markup=review_rating_kb(0)
+    )
 
 async def on_startup(bot: Bot):
     asyncio.create_task(reminder_loop())
