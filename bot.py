@@ -18,6 +18,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 API_TOKEN = os.getenv("API_TOKEN")
 ADMIN_IDS = set()
 for _key in ("ADMIN_ID", "ADMIN_ID2", "ADMIN_ID3"):
@@ -28,7 +29,7 @@ for _key in ("ADMIN_ID", "ADMIN_ID2", "ADMIN_ID3"):
 bot = Bot(token=API_TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
 
-DB_FILE = "bot.db"
+DB_FILE = os.path.join(BASE_DIR, "bot.db")
 
 def db_connect():
     return sqlite3.connect(DB_FILE)
@@ -41,7 +42,8 @@ def init_db():
             service TEXT NOT NULL, year INTEGER NOT NULL, month INTEGER NOT NULL,
             day INTEGER NOT NULL, time TEXT NOT NULL, name TEXT NOT NULL,
             phone TEXT NOT NULL, reminded_24 INTEGER DEFAULT 0,
-            reminded_2 INTEGER DEFAULT 0, review_sent INTEGER DEFAULT 0
+            reminded_2 INTEGER DEFAULT 0, review_sent INTEGER DEFAULT 0,
+            rebooking_sent INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS schedule (
             id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL,
@@ -78,6 +80,49 @@ def init_db():
             photo_id TEXT NOT NULL,
             sort_order INTEGER DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS bot_users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT DEFAULT '',
+            first_name TEXT DEFAULT '',
+            added_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS broadcasts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT NOT NULL,
+            btn_text TEXT DEFAULT '',
+            btn_url TEXT DEFAULT '',
+            sent_count INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS referrals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_id INTEGER NOT NULL,
+            referred_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            voucher_sent INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS vouchers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL UNIQUE,
+            user_id INTEGER NOT NULL,
+            discount_pct INTEGER NOT NULL DEFAULT 30,
+            used INTEGER DEFAULT 0,
+            used_at TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS banned_users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT DEFAULT '',
+            banned_at TEXT NOT NULL,
+            reason TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS tips (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT DEFAULT '',
+            stars INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
     """)
     con.commit(); con.close()
 
@@ -87,6 +132,35 @@ def migrate_db():
     con = db_connect()
     for stmt in [
         "ALTER TABLE bookings ADD COLUMN review_sent INTEGER DEFAULT 0",
+        "ALTER TABLE bookings ADD COLUMN rebooking_sent INTEGER DEFAULT 0",
+        "ALTER TABLE referrals ADD COLUMN voucher_sent INTEGER DEFAULT 0",
+        """CREATE TABLE IF NOT EXISTS tips (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT DEFAULT '',
+            stars INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS bot_users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT DEFAULT '',
+            first_name TEXT DEFAULT '',
+            added_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS broadcasts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT NOT NULL,
+            btn_text TEXT DEFAULT '',
+            btn_url TEXT DEFAULT '',
+            sent_count INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS referrals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_id INTEGER NOT NULL,
+            referred_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )""",
         "ALTER TABLE reviews ADD COLUMN username TEXT DEFAULT ''",
         "ALTER TABLE services ADD COLUMN description TEXT DEFAULT ''",
         """CREATE TABLE IF NOT EXISTS friends (
@@ -130,6 +204,149 @@ def delete_friend(fid):
     con = db_connect()
     con.execute("DELETE FROM friends WHERE id=?", (fid,))
     con.commit(); con.close()
+
+# ── Bot users ─────────────────────────────────────────────────────────────────
+def register_user(user_id, username="", first_name=""):
+    con = db_connect()
+    con.execute(
+        "INSERT OR IGNORE INTO bot_users (user_id, username, first_name, added_at) VALUES (?,?,?,?)",
+        (user_id, username or "", first_name or "", datetime.now().strftime("%Y-%m-%d %H:%M"))
+    ); con.commit(); con.close()
+
+def get_all_user_ids():
+    con = db_connect()
+    rows = con.execute("SELECT user_id FROM bot_users").fetchall()
+    con.close(); return [r[0] for r in rows]
+
+def get_users_count():
+    con = db_connect()
+    n = con.execute("SELECT COUNT(*) FROM bot_users").fetchone()[0]
+    con.close(); return n
+
+# ── Broadcasts ────────────────────────────────────────────────────────────────
+def save_broadcast(text, btn_text, btn_url, sent_count):
+    con = db_connect()
+    con.execute(
+        "INSERT INTO broadcasts (text, btn_text, btn_url, sent_count, created_at) VALUES (?,?,?,?,?)",
+        (text or "", btn_text or "", btn_url or "", sent_count, datetime.now().strftime("%Y-%m-%d %H:%M"))
+    ); con.commit(); con.close()
+
+def get_broadcasts():
+    con = db_connect()
+    rows = con.execute("SELECT id, text, btn_text, btn_url, sent_count, created_at FROM broadcasts ORDER BY id DESC LIMIT 20").fetchall()
+    con.close()
+    return [{"id":r[0],"text":r[1],"btn_text":r[2],"btn_url":r[3],"sent_count":r[4],"created_at":r[5]} for r in rows]
+
+def add_referral(referrer_id, referred_id):
+    con = db_connect()
+    exists = con.execute("SELECT id FROM referrals WHERE referred_id=?", (referred_id,)).fetchone()
+    if exists: con.close(); return False
+    con.execute("INSERT INTO referrals (referrer_id, referred_id, created_at) VALUES (?,?,?)",
+        (referrer_id, referred_id, datetime.now().strftime("%Y-%m-%d %H:%M")))
+    con.commit(); con.close(); return True
+
+def get_referral_count(user_id):
+    con = db_connect()
+    n = con.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (user_id,)).fetchone()[0]
+    con.close(); return n
+
+# ── Vouchers ──────────────────────────────────────────────────────────────────
+import random, string
+
+def generate_voucher_code():
+    return "DARIA-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+
+def create_voucher(user_id, discount_pct=30):
+    con = db_connect()
+    for _ in range(10):
+        code = generate_voucher_code()
+        try:
+            con.execute("INSERT INTO vouchers (code, user_id, discount_pct, created_at) VALUES (?,?,?,?)",
+                (code, user_id, discount_pct, datetime.now().strftime("%Y-%m-%d %H:%M")))
+            con.commit(); con.close(); return code
+        except: continue
+    con.close(); return None
+
+def get_all_vouchers():
+    con = db_connect()
+    rows = con.execute("SELECT id, code, user_id, discount_pct, used, used_at, created_at FROM vouchers ORDER BY id DESC LIMIT 50").fetchall()
+    con.close()
+    return [{"id":r[0],"code":r[1],"user_id":r[2],"discount_pct":r[3],"used":r[4],"used_at":r[5],"created_at":r[6]} for r in rows]
+
+def get_user_vouchers(user_id):
+    con = db_connect()
+    rows = con.execute("SELECT id, code, discount_pct, used, used_at, created_at FROM vouchers WHERE user_id=? ORDER BY id DESC", (user_id,)).fetchall()
+    con.close()
+    result = []
+    for r in rows:
+        v = {"id":r[0],"code":r[1],"discount_pct":r[2],"used":r[3],"used_at":r[4],"created_at":r[5]}
+        try:
+            created = datetime.strptime(v["created_at"], "%Y-%m-%d %H:%M")
+            v["expired"] = (datetime.now() - created).days > 180
+        except: v["expired"] = False
+        result.append(v)
+    return result
+
+def use_voucher(code):
+    con = db_connect()
+    con.execute("UPDATE vouchers SET used=1, used_at=? WHERE code=?",
+        (datetime.now().strftime("%Y-%m-%d %H:%M"), code.upper()))
+    con.commit(); con.close()
+
+def get_voucher(code):
+    con = db_connect()
+    row = con.execute("SELECT id, code, user_id, discount_pct, used, used_at, created_at FROM vouchers WHERE code=?", (code.upper(),)).fetchone()
+    con.close()
+    if not row: return None
+    v = {"id":row[0],"code":row[1],"user_id":row[2],"discount_pct":row[3],"used":row[4],"used_at":row[5],"created_at":row[6]}
+    # Проверяем срок 180 дней
+    try:
+        created = datetime.strptime(v["created_at"], "%Y-%m-%d %H:%M")
+        if (datetime.now() - created).days > 180:
+            v["expired"] = True
+        else:
+            v["expired"] = False
+    except:
+        v["expired"] = False
+    return v
+
+# ── Ban helpers ───────────────────────────────────────────────────────────────
+def ban_user(user_id, username=""):
+    con = db_connect()
+    con.execute("INSERT OR REPLACE INTO banned_users (user_id, username, banned_at) VALUES (?,?,?)",
+        (user_id, username or "", datetime.now().strftime("%Y-%m-%d %H:%M")))
+    # Удаляем все брони
+    bookings = con.execute("SELECT * FROM bookings WHERE user_id=?", (user_id,)).fetchall()
+    for row in bookings:
+        b = _row_to_booking(row)
+        con.execute("INSERT INTO cancelled (user_id,service,year,month,day,time,name,phone,cancelled_by,cancelled_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (b["user_id"],b["service"],b["year"],b["month"],b["day"],b["time"],b["name"],b["phone"],
+             "ban", datetime.now().strftime("%Y-%m-%d %H:%M")))
+    con.execute("DELETE FROM bookings WHERE user_id=?", (user_id,))
+    con.commit(); con.close()
+
+def unban_user(user_id):
+    con = db_connect()
+    con.execute("DELETE FROM banned_users WHERE user_id=?", (user_id,))
+    con.commit(); con.close()
+
+def is_banned(user_id):
+    con = db_connect()
+    row = con.execute("SELECT user_id FROM banned_users WHERE user_id=?", (user_id,)).fetchone()
+    con.close(); return row is not None
+
+def get_banned_users():
+    con = db_connect()
+    rows = con.execute("SELECT user_id, username, banned_at FROM banned_users ORDER BY banned_at DESC").fetchall()
+    con.close()
+    return [{"user_id":r[0],"username":r[1],"banned_at":r[2]} for r in rows]
+
+def find_user_by_username(username):
+    username = username.lstrip("@").lower()
+    con = db_connect()
+    row = con.execute("SELECT user_id, username, first_name FROM bot_users WHERE LOWER(username)=?", (username,)).fetchone()
+    con.close()
+    return {"user_id":row[0],"username":row[1],"first_name":row[2]} if row else None
 # ─────────────────────────────────────────────────────────────────────────────
 
 _DEFAULT_SERVICES = [
@@ -240,7 +457,8 @@ def update_booking_field(bid, field, value):
 def _row_to_booking(row):
     return {"id":row[0],"user_id":row[1],"service":row[2],"year":row[3],"month":row[4],
             "day":row[5],"time":row[6],"name":row[7],"phone":row[8],
-            "reminded_24":row[9],"reminded_2":row[10],"review_sent":row[11] if len(row)>11 else 0}
+            "reminded_24":row[9],"reminded_2":row[10],"review_sent":row[11] if len(row)>11 else 0,
+            "rebooking_sent":row[12] if len(row)>12 else 0}
 
 def log_cancellation(b, cancelled_by):
     con = db_connect()
@@ -271,6 +489,7 @@ def get_service_price_int(service_name):
 
 def get_stats():
     con = db_connect(); s = {}
+    now = datetime.now()
     s["total_active"]    = con.execute("SELECT COUNT(*) FROM bookings").fetchone()[0]
     s["total_cancelled"] = con.execute("SELECT COUNT(*) FROM cancelled").fetchone()[0]
     s["total_transfers"] = con.execute("SELECT COUNT(*) FROM transfers").fetchone()[0]
@@ -281,12 +500,48 @@ def get_stats():
     s["by_service"] = rows
     s["total_revenue"] = sum(get_service_price_int(r[0]) for r in con.execute("SELECT service FROM bookings").fetchall())
     s["revenue_by_service"] = {svc:get_service_price_int(svc)*cnt for svc,cnt in rows}
-    now = datetime.now()
     s["month_revenue"] = sum(get_service_price_int(r[0]) for r in con.execute(
         "SELECT service FROM bookings WHERE year=? AND month=?", (now.year,now.month)).fetchall())
     s["cancelled_by_client"] = con.execute("SELECT COUNT(*) FROM cancelled WHERE cancelled_by='client'").fetchone()[0]
     s["cancelled_by_master"] = con.execute("SELECT COUNT(*) FROM cancelled WHERE cancelled_by='master'").fetchone()[0]
     s["last_reviews"] = con.execute("SELECT rating,text,service,created_at FROM reviews ORDER BY id DESC LIMIT 5").fetchall()
+    con.close(); return s
+
+def get_stats_month(year, month):
+    con = db_connect(); s = {}
+    s["bookings"] = con.execute("SELECT COUNT(*) FROM bookings WHERE year=? AND month=?", (year,month)).fetchone()[0]
+    s["cancelled"] = con.execute("SELECT COUNT(*) FROM cancelled WHERE strftime('%Y'||'-'||printf('%02d',cancelled_at) LIKE ?)", (f"{year}-{month:02d}%",)).fetchone()[0] if False else \
+        con.execute("SELECT COUNT(*) FROM cancelled WHERE substr(cancelled_at,1,7)=?", (f"{year}-{month:02d}",)).fetchone()[0]
+    s["revenue"] = sum(get_service_price_int(r[0]) for r in con.execute(
+        "SELECT service FROM bookings WHERE year=? AND month=?", (year,month)).fetchall())
+    rows = con.execute("SELECT service,COUNT(*) FROM bookings WHERE year=? AND month=? GROUP BY service ORDER BY COUNT(*) DESC", (year,month)).fetchall()
+    s["by_service"] = rows
+    avg = con.execute("SELECT AVG(rating) FROM reviews WHERE substr(created_at,1,7)=?", (f"{year}-{month:02d}",)).fetchone()[0]
+    s["avg_rating"] = round(avg,1) if avg else 0
+    s["reviews"] = con.execute("SELECT COUNT(*) FROM reviews WHERE substr(created_at,1,7)=?", (f"{year}-{month:02d}",)).fetchone()[0]
+    tips_rows = con.execute("SELECT stars FROM tips WHERE substr(created_at,1,7)=?", (f"{year}-{month:02d}",)).fetchall()
+    s["tips_count"] = len(tips_rows)
+    s["tips_stars"] = sum(r[0] for r in tips_rows)
+    s["tips_eur"] = round(s["tips_stars"] * 0.013, 2)
+    con.close(); return s
+
+def get_stats_all():
+    con = db_connect(); s = {}
+    s["total_bookings"]  = con.execute("SELECT COUNT(*) FROM bookings").fetchone()[0]
+    s["total_cancelled"] = con.execute("SELECT COUNT(*) FROM cancelled").fetchone()[0]
+    s["total_transfers"] = con.execute("SELECT COUNT(*) FROM transfers").fetchone()[0]
+    s["total_reviews"]   = con.execute("SELECT COUNT(*) FROM reviews").fetchone()[0]
+    avg = con.execute("SELECT AVG(rating) FROM reviews").fetchone()[0]
+    s["avg_rating"] = round(avg,1) if avg else 0
+    s["total_revenue"] = sum(get_service_price_int(r[0]) for r in con.execute("SELECT service FROM bookings").fetchall())
+    rows = con.execute("SELECT service,COUNT(*) FROM bookings GROUP BY service ORDER BY COUNT(*) DESC").fetchall()
+    s["by_service"] = rows
+    s["cancelled_by_client"] = con.execute("SELECT COUNT(*) FROM cancelled WHERE cancelled_by='client'").fetchone()[0]
+    s["cancelled_by_master"] = con.execute("SELECT COUNT(*) FROM cancelled WHERE cancelled_by='master'").fetchone()[0]
+    tips_rows = con.execute("SELECT stars FROM tips").fetchall()
+    s["tips_count"] = len(tips_rows)
+    s["tips_stars"] = sum(r[0] for r in tips_rows)
+    s["tips_eur"] = round(s["tips_stars"] * 0.013, 2)
     con.close(); return s
 
 def get_client_visits(user_id):
@@ -333,7 +588,7 @@ MONTHS_GEN = {1:"Января",2:"Февраля",3:"Марта",4:"Апреля
 TIME_SLOTS = ["09:00","10:00","11:00","12:00","13:00","14:00","15:00","16:00","17:00","18:00"]
 
 class Booking(StatesGroup):
-    service=State(); year=State(); month=State(); day=State(); time=State(); name=State(); phone=State()
+    service=State(); year=State(); month=State(); day=State(); time=State(); name=State(); phone=State(); voucher=State()
 
 class EditBooking(StatesGroup):
     service=State(); year=State(); month=State(); day=State(); time=State(); name=State(); phone=State()
@@ -361,6 +616,12 @@ class EditService(StatesGroup):
 
 class AddFriend(StatesGroup):
     photo=State(); name=State(); specialty=State(); description=State(); link=State()
+
+class Broadcast(StatesGroup):
+    text=State(); btn_text=State(); btn_url=State(); confirm=State()
+
+class BanUser(StatesGroup):
+    username=State()
 
 def date_key(year, month, day): return f"{year}-{month:02d}-{day:02d}"
 def is_day_blocked(year, month, day): return date_key(year,month,day) in get_blocked_days()
@@ -411,8 +672,8 @@ def format_booking(b, idx=None, username=None):
     return f"{prefix}💅 {b['service']}\n⏱ Длительность: ~{dur_str}\n🕐 {b['time']} | {b['day']} {month_name}\n👤 {b['name']} 📞 {b['phone']}{tg_line}{addr}".strip()
 
 def bottom_kb(is_admin=False):
-    row1 = [KeyboardButton(text="💅 Услуги"), KeyboardButton(text="📋 Мои брони"), KeyboardButton(text="🖼 Портфолио")]
-    row2 = [KeyboardButton(text="💬 Чат"), KeyboardButton(text="💅 Мастера"), KeyboardButton(text="⭐ Отзывы")]
+    row1 = [KeyboardButton(text="💅 Услуги"), KeyboardButton(text="📋 Брони"), KeyboardButton(text="🎀 Ваучеры")]
+    row2 = [KeyboardButton(text="💬 Спросить"), KeyboardButton(text="💅 Мастера"), KeyboardButton(text="⭐ Отзывы")]
     buttons = [row1, row2]
     if is_admin: buttons.append([KeyboardButton(text="🔐 Админка")])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
@@ -421,6 +682,7 @@ def main_menu_kb():
     rows = []
     for s in get_services_db():
         rows.append([InlineKeyboardButton(text=f"{s['name']} — {s['price']} (~{s['duration']})", callback_data=f"svc:{s['name']}")])
+    rows.append([InlineKeyboardButton(text="🖼 Портфолио", callback_data="show_portfolio")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def months_kb(year):
@@ -502,14 +764,16 @@ def services_edit_kb(bid):
 
 def admin_panel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Все брони",           callback_data="admin_all")],
-        [InlineKeyboardButton(text="📅 Брони на сегодня",    callback_data="admin_today")],
-        [InlineKeyboardButton(text="🔜 Брони на завтра",     callback_data="admin_tomorrow")],
-        [InlineKeyboardButton(text="🗓 Моё расписание",      callback_data="admin_schedule")],
-        [InlineKeyboardButton(text="📊 Статистика",          callback_data="admin_stats")],
-        [InlineKeyboardButton(text="💅 Управление услугами", callback_data="admin_services")],
-        [InlineKeyboardButton(text="⭐ Управление отзывами", callback_data="admin_reviews")],
-        [InlineKeyboardButton(text="💅 Управление мастерами", callback_data="admin_masters")]])
+        [InlineKeyboardButton(text="📋 Все брони",      callback_data="admin_all"),
+         InlineKeyboardButton(text="📅 На сегодня",     callback_data="admin_today")],
+        [InlineKeyboardButton(text="🗓 Расписание",     callback_data="admin_schedule"),
+         InlineKeyboardButton(text="📊 Статистика",     callback_data="admin_stats")],
+        [InlineKeyboardButton(text="💅 Услуги",         callback_data="admin_services"),
+         InlineKeyboardButton(text="⭐ Отзывы",         callback_data="admin_reviews")],
+        [InlineKeyboardButton(text="💅 Мастера",        callback_data="admin_masters"),
+         InlineKeyboardButton(text="📣 Рассылка",       callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="🎀 Ваучеры",        callback_data="admin_vouchers"),
+         InlineKeyboardButton(text="🚫 Бан",            callback_data="admin_ban_menu")]])
 
 def admin_friends_kb():
     rows = []
@@ -604,11 +868,52 @@ def schedule_slots_kb(month, day, action):
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_schedule")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+# ── Ban middleware (registered after DB init) ─────────────────────────────────
+@dp.message.outer_middleware()
+async def ban_check_middleware(handler, event, data):
+    try:
+        if hasattr(event, 'from_user') and event.from_user:
+            if is_banned(event.from_user.id):
+                if not (hasattr(event, 'text') and event.text and event.text.startswith('/start')):
+                    await event.answer("⛔️ Доступ к боту ограничен.")
+                    return
+    except Exception: pass
+    return await handler(event, data)
+# ─────────────────────────────────────────────────────────────────────────────
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
+    user_id = message.from_user.id
+    if is_banned(user_id):
+        await message.answer("⛔️ Доступ к боту ограничен."); return
+    register_user(user_id, message.from_user.username or "", message.from_user.first_name or "")
+    # Обработка реферальной ссылки
+    args = message.text.split()
+    if len(args) > 1 and args[1].startswith("ref_"):
+        try:
+            referrer_id = int(args[1].split("_")[1])
+            if referrer_id != user_id:
+                is_new = add_referral(referrer_id, user_id)
+                if is_new:
+                    # Просто сообщаем — ваучеры выдадутся после завершения услуги
+                    referrer_name = message.from_user.first_name or "Клиент"
+                    try:
+                        await bot.send_message(referrer_id,
+                            f"🎀 По твоей ссылке пришёл новый клиент — {referrer_name}!\n\n"
+                            f"Ваучер на скидку 30% вы оба получите после того как подруга завершит свой первый визит 💕")
+                    except: pass
+                    await message.answer(
+                        f"🎀 Ты пришла по реферальной ссылке подруги!\n\n"
+                        f"После твоего первого визита к Дарье вы обе получите ваучер на скидку *30%* 💅\n\n"
+                        f"Записывайся — и бонус придёт автоматически!",
+                        parse_mode="Markdown")
+                    for _aid in ADMIN_IDS:
+                        try: await bot.send_message(_aid, f"🎀 Новый реферал!\n\n👤 {referrer_name} пришёл по чьей-то ссылке.\nВаучеры выдадутся после первого завершённого визита.")
+                        except: pass
+        except: pass
     is_admin = message.from_user.id in ADMIN_IDS
-    photo = FSInputFile("images/darja.png")
+    photo = FSInputFile(os.path.join(BASE_DIR, "images/darja.png"))
     await message.answer_photo(photo=photo, caption="👋 Привет! Я помощник по записи\nк мастеру маникюра Дарье 💅", reply_markup=bottom_kb(is_admin))
     await message.answer("💅 Выберите услугу:", reply_markup=main_menu_kb())
 
@@ -616,7 +921,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def btn_services(message: types.Message, state: FSMContext):
     await state.clear(); await message.answer("Выберите услугу 👇", reply_markup=main_menu_kb())
 
-@dp.message(F.text == "📋 Мои брони")
+@dp.message(F.text == "📋 Брони")
 async def btn_my_bookings(message: types.Message, state: FSMContext):
     await state.clear()
     if not get_user_bookings(message.from_user.id):
@@ -681,24 +986,69 @@ async def friends_back(call: types.CallbackQuery):
     await call.message.answer("💅 Мастера красоты\n\nВыберите мастера 👇", reply_markup=kb)
     await call.answer()
 
-@dp.message(F.text == "🖼 Портфолио")
-async def btn_portfolio(message: types.Message):
-    portfolio_files = [f"images/{i}.jpg" for i in range(86, 100)]
+@dp.message(F.text == "🎀 Ваучеры")
+async def btn_referral(message: types.Message):
+    user_id = message.from_user.id
+    ref_link = f"https://t.me/{(await bot.get_me()).username}?start=ref_{user_id}"
+    vouchers = get_user_vouchers(user_id)
+    active = [v for v in vouchers if not v["used"] and not v.get("expired")]
+    expired = [v for v in vouchers if not v["used"] and v.get("expired")]
+    used = [v for v in vouchers if v["used"]]
+
+    if not vouchers:
+        # Нет ваучеров — показываем инструкцию
+        await message.answer(
+            f"🎀 *Ваучеры на скидку*\n\n"
+            f"Приведи подругу к Дарье — и вы обе получите ваучер на *скидку 30%* на любую услугу! 💕\n\n"
+            f"Как это работает:\n"
+            f"1️⃣ Скопируй свою ссылку ниже\n"
+            f"2️⃣ Отправь подруге\n"
+            f"3️⃣ Когда она запишется и сходит на процедуру — обе получат ваучер\n"
+            f"4️⃣ При записи введи код ваучера и получи скидку\n\n"
+            f"Твоя ссылка:\n`{ref_link}`",
+            parse_mode="Markdown")
+        return
+
+    text = f"🎀 *Мои ваучеры*\n\n"
+    if active:
+        text += "✅ *Активные:*\n"
+        for v in active:
+            text += f"`{v['code']}` — скидка {v['discount_pct']}% (действует 180 дней)\n"
+        text += "\n"
+    if expired:
+        text += "⏰ *Просроченные:*\n"
+        for v in expired:
+            text += f"`{v['code']}` — истёк срок\n"
+        text += "\n"
+    if used:
+        text += f"✔️ Использовано: {len(used)} ваучер(ов)\n\n"
+
+    text += f"📌 Чтобы применить ваучер — введи код при оформлении записи.\n\n"
+    text += f"━━━━━━━━━━━━━━━━━\n"
+    text += f"🎀 *Как получить ещё?*\n"
+    text += f"Поделись ссылкой с подругой — когда она запишется, вы обе получите новый ваучер -30%!\n\n"
+    text += f"Твоя ссылка:\n`{ref_link}`"
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.callback_query(F.data == "show_portfolio")
+async def cb_portfolio(call: types.CallbackQuery):
+    portfolio_files = [os.path.join(BASE_DIR, f"images/{i}.jpg") for i in range(86, 100)]
     existing = [f for f in portfolio_files if os.path.exists(f)]
     if not existing:
-        await message.answer("🖼 Портфолио пока пустое — скоро добавим работы! 💅")
-        return
+        await call.answer("🖼 Портфолио пока пустое — скоро добавим работы! 💅", show_alert=True); return
+    await call.answer()
     chunk_size = 10
     for i in range(0, len(existing), chunk_size):
         chunk = existing[i:i + chunk_size]
         media = [types.InputMediaPhoto(media=FSInputFile(path)) for path in chunk]
-        await message.answer_media_group(media=media)
+        await call.message.answer_media_group(media=media)
 
-@dp.message(F.text == "💬 Чат")
+@dp.message(F.text == "💬 Спросить")
 async def btn_chat(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Открыть чат", url="https://t.me/beautytallinn")]])
-    await message.answer("👇", reply_markup=kb)
+        [InlineKeyboardButton(text="👥 Сообщество", url="https://t.me/beautytallinn")],
+        [InlineKeyboardButton(text="✍️ Написать Дарье", url="https://t.me/Vi_da_ch_iV")]])
+    await message.answer("💬 Выбери как удобнее:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("tip_open:"))
 async def tip_open(call: types.CallbackQuery):
@@ -758,10 +1108,16 @@ async def pre_checkout(query: types.PreCheckoutQuery):
 @dp.message(F.successful_payment)
 async def successful_payment(message: types.Message):
     stars = message.successful_payment.total_amount
+    username = message.from_user.username or message.from_user.first_name or ""
+    # Сохраняем чаевые в БД
+    con = db_connect()
+    con.execute("INSERT INTO tips (user_id, username, stars, created_at) VALUES (?,?,?,?)",
+        (message.from_user.id, username, stars, datetime.now().strftime("%Y-%m-%d %H:%M")))
+    con.commit(); con.close()
     await message.answer(f"🙏 Спасибо за {stars} ⭐! Дарья очень рада 💅")
     for _aid in ADMIN_IDS:
         try:
-            await bot.send_message(_aid, f"💝 Новые чаевые! {stars} ⭐ от @{message.from_user.username or message.from_user.first_name}")
+            await bot.send_message(_aid, f"💝 Новые чаевые! {stars} ⭐ от @{username}")
         except: pass
 
 @dp.message(F.text == "🔐 Админка")
@@ -900,7 +1256,7 @@ async def service_choice(call: types.CallbackQuery, state: FSMContext):
     service_name=call.data[4:]; svc=get_service(service_name)
     if not svc: await call.answer("Услуга не найдена.", show_alert=True); return
     year=datetime.now().year; await state.update_data(service=service_name,year=year)
-    photo=FSInputFile(svc["img"])
+    photo=FSInputFile(os.path.join(BASE_DIR, svc["img"]))
     desc_line = f"\n\n📝 {svc['description']}" if svc.get("description") else ""
     await call.message.answer_photo(photo=photo,
         caption=f"✅ Вы выбрали: {service_name}\n💰 {svc['price']} | ⏱ {svc['duration']}{desc_line}\n\nВыберите месяц:",
@@ -953,21 +1309,87 @@ async def enter_name(message: types.Message, state: FSMContext):
 async def enter_phone(message: types.Message, state: FSMContext):
     if re.search(r"[a-zA-Zа-яА-ЯёЁ]", message.text or ""):
         await message.answer("⚠️ Номер не должен содержать буквы. Попробуйте ещё раз:"); return
-    data=await state.get_data(); user_id=message.from_user.id
-    svc=get_service(data.get("service","")); dur=duration_minutes(svc)
-    yr=data.get("year") or datetime.now().year; mon=data.get("month"); day=data.get("day")
-    available=get_available_slots(yr,mon,day,dur)
+    await state.update_data(phone=message.text)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎀 Ввести ваучер", callback_data="enter_voucher")],
+        [InlineKeyboardButton(text="➡️ Без ваучера", callback_data="skip_voucher")]])
+    await message.answer("🎀 Есть ваучер на скидку?\n\nВведите код или продолжите без него:", reply_markup=kb)
+    await state.set_state(Booking.voucher)
+
+@dp.callback_query(F.data == "enter_voucher", Booking.voucher)
+async def ask_voucher_code(call: types.CallbackQuery, state: FSMContext):
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➡️ Без ваучера", callback_data="skip_voucher")]])
+    await call.message.answer("Введите код ваучера (например: DARIA-X7K2):", reply_markup=cancel_kb)
+    await call.answer()
+
+@dp.callback_query(F.data == "skip_voucher", Booking.voucher)
+async def skip_voucher(call: types.CallbackQuery, state: FSMContext):
+    await state.update_data(voucher_code=None, voucher_discount=0)
+    await _finalize_booking(call.message, state, call.from_user.id)
+    await call.answer()
+
+@dp.message(Booking.voucher)
+async def process_voucher_code(message: types.Message, state: FSMContext):
+    code = message.text.strip().upper()
+    voucher = get_voucher(code)
+    if not voucher:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➡️ Без ваучера", callback_data="skip_voucher")]])
+        await message.answer("❌ Ваучер не найден. Проверьте код и попробуйте снова:", reply_markup=kb); return
+    if voucher["used"]:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➡️ Без ваучера", callback_data="skip_voucher")]])
+        await message.answer("❌ Этот ваучер уже использован.", reply_markup=kb); return
+    await state.update_data(voucher_code=code, voucher_discount=voucher["discount_pct"])
+    data = await state.get_data()
+    svc = get_service(data.get("service", ""))
+    price_str = svc["price"] if svc else ""
+    m = re.search(r"(\d+)", price_str)
+    if m:
+        original = int(m.group(1))
+        discounted = round(original * (1 - voucher["discount_pct"] / 100))
+        price_info = f"💰 {original}€ → {discounted}€ (-{voucher['discount_pct']}%)"
+    else:
+        price_info = f"Скидка {voucher['discount_pct']}%"
+    await message.answer(f"✅ Ваучер применён!\n\n{price_info}\n\nОформляю запись...")
+    await _finalize_booking(message, state, message.from_user.id)
+
+async def _finalize_booking(message, state, user_id):
+    data = await state.get_data()
+    svc = get_service(data.get("service", "")); dur = duration_minutes(svc)
+    yr = data.get("year") or datetime.now().year; mon = data.get("month"); day = data.get("day")
+    phone = data.get("phone", "")
+    available = get_available_slots(yr, mon, day, dur)
     if data["time"] not in available:
         await message.answer("⚠️ Это время уже заняли пока вы оформляли запись.\nПожалуйста, начните заново 👇", reply_markup=main_menu_kb())
         await state.clear(); return
-    bid=add_booking(user_id=user_id,service=data["service"],year=yr,month=mon,day=day,time=data["time"],name=data["name"],phone=message.text)
-    b=get_booking(bid)
-    await message.answer(f"✅ Бронь подтверждена!\n\n{format_booking(b)}\n\n━━━━━━━━━━━━━━━━━\n📍 Контакты Дарьи:\n{CONTACTS_SHORT}", reply_markup=back_to_menu_kb())
-    tg=message.from_user.username; tg_line=f"\n💬 @{tg}" if tg else ""
-    visits=get_client_visits(user_id); rank=get_client_rank(visits)
-    vw="визит" if visits==1 else ("визита" if 2<=visits<=4 else "визитов")
+    voucher_code = data.get("voucher_code")
+    voucher_discount = data.get("voucher_discount", 0)
+    bid = add_booking(user_id=user_id, service=data["service"], year=yr, month=mon, day=day, time=data["time"], name=data["name"], phone=phone)
+    b = get_booking(bid)
+    # Применяем ваучер
+    voucher_line = ""
+    if voucher_code and voucher_discount:
+        use_voucher(voucher_code)
+        m = re.search(r"(\d+)", svc["price"] if svc else "")
+        if m:
+            original = int(m.group(1))
+            discounted = round(original * (1 - voucher_discount / 100))
+            voucher_line = f"\n🎀 Ваучер {voucher_code}: {original}€ → {discounted}€"
+    await message.answer(f"✅ Бронь подтверждена!\n\n{format_booking(b)}{voucher_line}\n\n━━━━━━━━━━━━━━━━━\n📍 Контакты Дарьи:\n{CONTACTS_SHORT}", reply_markup=back_to_menu_kb())
+    tg = getattr(message, 'from_user', None)
+    tg_username = ""
+    try:
+        from aiogram.types import Message as AioMessage
+        if isinstance(message, AioMessage): tg_username = message.from_user.username or ""
+    except: pass
+    tg_line = f"\n💬 @{tg_username}" if tg_username else ""
+    visits = get_client_visits(user_id); rank = get_client_rank(visits)
+    vw = "визит" if visits == 1 else ("визита" if 2 <= visits <= 4 else "визитов")
+    voucher_admin = f"\n🎀 Ваучер: {voucher_code} (-{voucher_discount}%)" if voucher_code else ""
     for _aid in ADMIN_IDS:
-        try: await bot.send_message(_aid, f"🔔 Новая бронь!\n\n💅 {data['service']}\n⏱ ~{svc['duration'] if svc else ''}\n🕐 {data['time']} | {day} {MONTHS_GEN[mon]}\n👤 {data['name']} 📞 {message.text}{tg_line}\n{rank} • {visits} {vw}")
+        try: await bot.send_message(_aid, f"🔔 Новая бронь!\n\n💅 {data['service']}\n⏱ ~{svc['duration'] if svc else ''}\n🕐 {data['time']} | {day} {MONTHS_GEN[mon]}\n👤 {data['name']} 📞 {phone}{tg_line}\n{rank} • {visits} {vw}{voucher_admin}")
         except: pass
     await state.clear()
 
@@ -1015,22 +1437,27 @@ async def admin_actions(call: types.CallbackQuery):
     elif action=="admin_services":
         await call.message.answer("💅 Управление услугами:", reply_markup=admin_services_kb())
     elif action=="admin_stats":
-        try: s=get_stats()
-        except Exception as e: await call.message.answer(f"❌ Ошибка: {e}"); await call.answer(); return
         now=datetime.now()
-        text=(f"📊 Статистика\n\n📋 Активных: {s['total_active']}\n🗑 Отмен: {s['total_cancelled']} (клиент: {s['cancelled_by_client']}, мастер: {s['cancelled_by_master']})\n"
-              f"🔄 Переносов: {s['total_transfers']}\n⭐ Отзывов: {s['total_reviews']}")
-        if s["avg_rating"]: text+=f" | Оценка: {s['avg_rating']} ⭐"
-        text+=f"\n\n💰 За {MONTHS[now.month]}: {s['month_revenue']}€\n📊 Всего: {s['total_revenue']}€"
+        try: s=get_stats_month(now.year, now.month)
+        except Exception as e: await call.message.answer(f"❌ Ошибка: {e}"); await call.answer(); return
+        text=f"📊 {MONTHS[now.month]} {now.year}\n\n"
+        text+=f"📋 Записей: {s['bookings']}\n"
+        text+=f"🗑 Отмен: {s['cancelled']}\n"
+        text+=f"⭐ Отзывов: {s['reviews']}"
+        if s["avg_rating"]: text+=f" | {s['avg_rating']} ⭐"
+        text+=f"\n💰 Выручка: {s['revenue']}€"
+        text+=f"\n⭐ Чаевые: {s.get('tips_count',0)} раз | {s.get('tips_stars',0)} ⭐ ≈ {s.get('tips_eur',0)}€"
         if s["by_service"]:
             text+="\n\n💅 По услугам:\n"
             for svc_name,cnt in s["by_service"]:
-                text+=f"  • {svc_name}: {cnt} шт. → {s['revenue_by_service'].get(svc_name,0)}€\n"
-        if s["last_reviews"]:
-            text+="\n⭐ Последние отзывы:\n"
-            for rating,rv,svc_name,_ in s["last_reviews"]:
-                text+=f"  {'⭐'*rating} {svc_name}{(' — '+rv) if rv else ''}\n"
-        await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]]))
+                text+=f"  • {svc_name}: {cnt} шт.\n"
+        prev_month = now.month - 1 if now.month > 1 else 12
+        prev_year = now.year if now.month > 1 else now.year - 1
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"◀️ {MONTHS[prev_month]}", callback_data=f"stats_month:{prev_year}:{prev_month}")],
+            [InlineKeyboardButton(text="📊 За всё время", callback_data="stats_all")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]])
+        await call.message.answer(text, reply_markup=kb)
     elif action=="admin_reviews":
         con=db_connect()
         rows=con.execute("SELECT id,rating,text,service,created_at,username FROM reviews ORDER BY id DESC LIMIT 30").fetchall()
@@ -1038,28 +1465,27 @@ async def admin_actions(call: types.CallbackQuery):
         if not rows:
             await call.message.answer("⭐ Отзывов пока нет.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="✍️ Написать отзыв", callback_data="admin_rev_add")],
+                    [InlineKeyboardButton(text="✍️ Добавить отзыв", callback_data="admin_rev_add")],
                     [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]]))
             await call.answer(); return
-        text="⭐ Все отзывы:\n\n"
         kb_rows=[]
         for row in rows:
             rev_id,rating,rv,svc_name,created_at = row[0],row[1],row[2],row[3],row[4]
-            username = row[5] if len(row) > 5 and row[5] else "Аноним"
-            if username != "Аноним" and not username.startswith("@"):
-                username = "@" + username
+            username = row[5] if len(row) > 5 and row[5] else ""
             stars="⭐"*rating
-            date_str=created_at[:10] if created_at else ""
-            text+=f"#{rev_id} {stars} — {svc_name} ({date_str})\n"
-            text+=f"👤 {username}\n"
-            if rv: text+=f"💬 {rv}\n"
-            text+="\n"
-            kb_rows.append([
-                InlineKeyboardButton(text=f"✏️ #{rev_id}", callback_data=f"admin_rev_edit:{rev_id}"),
-                InlineKeyboardButton(text=f"🗑 #{rev_id}", callback_data=f"admin_rev_del:{rev_id}")])
-        kb_rows.append([InlineKeyboardButton(text="✍️ Написать отзыв", callback_data="admin_rev_add")])
+            label = f"@{username}" if username else f"#{rev_id}"
+            # Форматируем дату: "10 Марта"
+            MONTHS_BTN = {1:"Января",2:"Февраля",3:"Марта",4:"Апреля",5:"Мая",6:"Июня",7:"Июля",8:"Августа",9:"Сентября",10:"Октября",11:"Ноября",12:"Декабря"}
+            try:
+                from datetime import datetime as _dt
+                _d = _dt.strptime(created_at[:10], "%Y-%m-%d")
+                date_label = f"{_d.day} {MONTHS_BTN[_d.month]}"
+            except: date_label = ""
+            btn_label = f"{stars} {label} {date_label}"
+            kb_rows.append([InlineKeyboardButton(text=btn_label, callback_data=f"admin_rev_open:{rev_id}")])
+        kb_rows.append([InlineKeyboardButton(text="✍️ Добавить отзыв", callback_data="admin_rev_add")])
         kb_rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")])
-        await call.message.answer(text.strip(), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+        await call.message.answer("⭐ Отзывы клиентов:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
     elif action.startswith("admin_rev_del:"):
         rev_id=int(action.split(":")[1])
         con=db_connect(); con.execute("DELETE FROM reviews WHERE id=?", (rev_id,)); con.commit(); con.close()
@@ -1071,12 +1497,65 @@ async def admin_actions(call: types.CallbackQuery):
         await state.set_state(AdminReview.text)
         await call.message.answer("✏️ Введите новый текст отзыва (или /skip чтобы оставить без текста):",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_reviews")]]))
+    elif action.startswith("admin_rev_open:"):
+        rev_id=int(action.split(":")[1])
+        con=db_connect()
+        row=con.execute("SELECT id,rating,text,service,created_at,username FROM reviews WHERE id=?", (rev_id,)).fetchone()
+        con.close()
+        if not row:
+            await call.answer("Отзыв не найден", show_alert=True); return
+        _,rating,rv,svc_name,created_at,username = row
+        stars="⭐"*rating
+        uname = f"@{username}" if username else "Аноним"
+        date_str = created_at[:10] if created_at else ""
+        text = f"{stars}\n👤 {uname}\n💅 {svc_name}\n📅 {date_str}"
+        if rv: text += f"\n💬 {rv}"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"admin_rev_edit:{rev_id}"),
+             InlineKeyboardButton(text="🗑 Удалить", callback_data=f"admin_rev_del:{rev_id}")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_reviews")]])
+        await call.message.answer(text, reply_markup=kb)
     elif action=="admin_rev_add":
         await state.set_state(AdminReview.add_text)
         await call.message.answer("✍️ Введите текст отзыва от мастера:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_reviews")]]))
     elif action=="admin_masters":
         await call.message.answer("💅 Управление мастерами:", reply_markup=admin_friends_kb())
+    elif action=="admin_ban_menu":
+        banned = get_banned_users()
+        kb_rows = [[InlineKeyboardButton(text="🚫 Забанить по @username", callback_data="ban_start")]]
+        for b in banned[:10]:
+            uname = f"@{b['username']}" if b['username'] else f"id:{b['user_id']}"
+            kb_rows.append([InlineKeyboardButton(text=f"🔓 Разбанить {uname}", callback_data=f"unban:{b['user_id']}")])
+        kb_rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")])
+        await call.message.answer(
+            f"🚫 Бан-лист\n\nЗабанено: {len(banned)} чел." + ("\n\nНет забаненных." if not banned else ""),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    elif action=="admin_vouchers":
+        vouchers = get_all_vouchers()
+        if not vouchers:
+            await call.message.answer("🎀 Ваучеров пока нет.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]]))
+        else:
+            active = [v for v in vouchers if not v["used"]]
+            used = [v for v in vouchers if v["used"]]
+            text = f"🎀 Ваучеры\n\n✅ Активных: {len(active)} | ❌ Использованных: {len(used)}\n\n"
+            for v in vouchers[:20]:
+                status = f"✅ использован {v['used_at']}" if v["used"] else "🟢 активен"
+                text += f"`{v['code']}` — -{v['discount_pct']}% | {status}\n"
+            await call.message.answer(text, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]]))
+    elif action=="admin_broadcast":
+        broadcasts = get_broadcasts()
+        users_count = get_users_count()
+        kb_rows = [
+            [InlineKeyboardButton(text="✉️ Создать рассылку", callback_data="broadcast_start")],
+        ]
+        if broadcasts:
+            kb_rows.append([InlineKeyboardButton(text="📋 История рассылок", callback_data="broadcast_history")])
+        kb_rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")])
+        await call.message.answer(f"📣 Рассылка\n\nВсего пользователей: {users_count}\n\nВыберите действие:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
     elif action=="admin_back":
         await call.message.answer(f"🔐 Панель администратора\nВсего броней: {len(get_all_bookings())}", reply_markup=admin_panel_kb())
     elif action.startswith("admin_del:"):
@@ -1149,10 +1628,24 @@ async def friend_add_description(message: types.Message, state: FSMContext):
 @dp.message(AddFriend.link)
 async def friend_add_link(message: types.Message, state: FSMContext):
     data = await state.get_data()
+    await state.update_data(link=message.text.strip())
+    data = await state.get_data()
+    # Показываем предпросмотр
+    caption = f"👤 *{data['name']}* — {data['specialty']}\n\n{data['description']}\n\n🔗 {data['link']}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Сохранить", callback_data="friend_confirm"),
+         InlineKeyboardButton(text="❌ Отмена", callback_data="admin_masters")]])
+    await message.answer_photo(photo=data['photo_id'], caption=caption, parse_mode="Markdown", reply_markup=kb)
+
+@dp.callback_query(F.data == "friend_confirm")
+async def friend_confirm(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id not in ADMIN_IDS: await call.answer("⛔️", show_alert=True); return
+    data = await state.get_data()
     await state.clear()
-    add_friend(data['name'], data['specialty'], data['description'], message.text.strip(), data['photo_id'])
-    await message.answer(f"✅ Мастер {data['name']} добавлен в список друзей! 👯",
+    add_friend(data['name'], data['specialty'], data['description'], data['link'], data['photo_id'])
+    await call.message.answer(f"✅ Мастер {data['name']} добавлен! 👯",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ К списку", callback_data="admin_masters")]]))
+    await call.answer()
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data.startswith("svc_manage:"))
@@ -1480,6 +1973,238 @@ async def admin_rev_add_service(call: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="◀️ К отзывам", callback_data="admin_reviews")]]))
     await call.answer()
 
+# ── Broadcast handlers ────────────────────────────────────────────────────────
+@dp.callback_query(F.data == "broadcast_history")
+async def broadcast_history(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS: await call.answer("⛔️", show_alert=True); return
+    broadcasts = get_broadcasts()
+    if not broadcasts:
+        await call.answer("История пуста", show_alert=True); return
+    text = "📋 История рассылок (последние 20):\n\n"
+    for b in broadcasts:
+        preview = b["text"][:60] + ("..." if len(b["text"]) > 60 else "")
+        btn_info = f"\n🔗 Кнопка: {b['btn_text']}" if b["btn_text"] else ""
+        text += f"📅 {b['created_at']} | 👥 отправлено: {b['sent_count']}\n📝 {preview}{btn_info}\n\n"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="admin_broadcast")]])
+    await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+@dp.callback_query(F.data == "broadcast_start")
+async def broadcast_start(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id not in ADMIN_IDS: await call.answer("⛔️", show_alert=True); return
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcast")]])
+    await call.message.answer(
+        "✉️ Создание рассылки\n\nВведите текст сообщения:\n\n💡 Можно использовать эмодзи и переносы строк",
+        reply_markup=cancel_kb)
+    await state.set_state(Broadcast.text)
+    await call.answer()
+
+@dp.message(Broadcast.text)
+async def broadcast_get_text(message: types.Message, state: FSMContext):
+    await state.update_data(broadcast_text=message.text)
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➡️ Без кнопки", callback_data="broadcast_no_btn")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcast")]])
+    await message.answer(
+        "🔘 Введите текст кнопки (например: 💅 Записаться)\n\nИли нажмите «Без кнопки»:",
+        reply_markup=cancel_kb)
+    await state.set_state(Broadcast.btn_text)
+
+@dp.callback_query(F.data == "broadcast_no_btn", Broadcast.btn_text)
+async def broadcast_no_btn(call: types.CallbackQuery, state: FSMContext):
+    await state.update_data(broadcast_btn_text="", broadcast_btn_url="")
+    data = await state.get_data()
+    await _broadcast_preview(call.message, state, data)
+    await call.answer()
+
+@dp.message(Broadcast.btn_text)
+async def broadcast_get_btn_text(message: types.Message, state: FSMContext):
+    await state.update_data(broadcast_btn_text=message.text.strip())
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📝 Кнопка «Записаться»", callback_data="broadcast_btn_booking")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcast")]])
+    await message.answer(
+        "🔗 Введите ссылку для кнопки (например: https://t.me/username)\n\nИли нажмите «Записаться» — откроет меню бота:",
+        reply_markup=cancel_kb)
+    await state.set_state(Broadcast.btn_url)
+
+@dp.callback_query(F.data == "broadcast_btn_booking", Broadcast.btn_url)
+async def broadcast_btn_booking(call: types.CallbackQuery, state: FSMContext):
+    await state.update_data(broadcast_btn_url="booking")
+    data = await state.get_data()
+    await _broadcast_preview(call.message, state, data)
+    await call.answer()
+
+@dp.message(Broadcast.btn_url)
+async def broadcast_get_btn_url(message: types.Message, state: FSMContext):
+    url = message.text.strip()
+    if not url.startswith("http"):
+        await message.answer("⚠️ Ссылка должна начинаться с https://\n\nПопробуйте снова:"); return
+    await state.update_data(broadcast_btn_url=url)
+    data = await state.get_data()
+    await _broadcast_preview(message, state, data)
+
+async def _broadcast_preview(message, state, data):
+    text = data["broadcast_text"]
+    btn_text = data.get("broadcast_btn_text", "")
+    btn_url = data.get("broadcast_btn_url", "")
+    users_count = get_users_count()
+    preview = f"👁 Предпросмотр рассылки:\n\n{text}"
+    if btn_text:
+        url_display = "→ откроет меню записи" if btn_url == "booking" else btn_url
+        preview += f"\n\n🔘 Кнопка: [{btn_text}] {url_display}"
+    preview += f"\n\n👥 Будет отправлено: {users_count} пользователям"
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Отправить", callback_data="broadcast_confirm"),
+         InlineKeyboardButton(text="❌ Отмена", callback_data="broadcast_cancel")]])
+    await message.answer(preview, reply_markup=confirm_kb)
+    await state.set_state(Broadcast.confirm)
+
+@dp.callback_query(F.data == "broadcast_cancel")
+async def broadcast_cancel(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.answer("❌ Рассылка отменена.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="admin_broadcast")]]))
+    await call.answer()
+
+@dp.callback_query(F.data == "broadcast_confirm", Broadcast.confirm)
+async def broadcast_confirm(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id not in ADMIN_IDS: await call.answer("⛔️", show_alert=True); return
+    data = await state.get_data()
+    await state.clear()
+    text = data.get("broadcast_text") or ""
+    btn_text = data.get("broadcast_btn_text") or ""
+    btn_url = data.get("broadcast_btn_url") or ""
+    user_ids = get_all_user_ids()
+    sent = 0; failed = 0
+    progress_msg = await call.message.answer(f"📤 Отправляю... 0/{len(user_ids)}")
+    for i, uid in enumerate(user_ids):
+        try:
+            if btn_text and btn_url:
+                if btn_url == "booking":
+                    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_text, callback_data="main_menu")]])
+                else:
+                    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_text, url=btn_url)]])
+                await bot.send_message(uid, text, reply_markup=kb)
+            else:
+                await bot.send_message(uid, text)
+            sent += 1
+        except: failed += 1
+        if (i+1) % 10 == 0:
+            try: await progress_msg.edit_text(f"📤 Отправляю... {i+1}/{len(user_ids)}")
+            except: pass
+        await asyncio.sleep(0.05)
+    save_broadcast(text, btn_text, btn_url, sent)
+    await progress_msg.edit_text(f"✅ Рассылка завершена!\n\n✉️ Отправлено: {sent}\n❌ Не доставлено: {failed}")
+    await call.answer()
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Ban handlers ──────────────────────────────────────────────────────────────
+@dp.callback_query(F.data == "admin_ban_menu")
+# ── Stats handlers ────────────────────────────────────────────────────────────
+@dp.callback_query(F.data.startswith("stats_month:"))
+async def stats_month_handler(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS: await call.answer("⛔️", show_alert=True); return
+    _, year_str, month_str = call.data.split(":")
+    year, month = int(year_str), int(month_str)
+    now = datetime.now()
+    try: s = get_stats_month(year, month)
+    except Exception as e: await call.answer(f"Ошибка: {e}", show_alert=True); return
+    text = f"📊 {MONTHS[month]} {year}\n\n"
+    text += f"📋 Записей: {s['bookings']}\n"
+    text += f"🗑 Отмен: {s['cancelled']}\n"
+    text += f"⭐ Отзывов: {s['reviews']}"
+    if s["avg_rating"]: text += f" | {s['avg_rating']} ⭐"
+    text += f"\n💰 Выручка: {s['revenue']}€"
+    text += f"\n⭐ Чаевые: {s.get('tips_count',0)} раз | {s.get('tips_stars',0)} ⭐ ≈ {s.get('tips_eur',0.0)}€"
+    if s["by_service"]:
+        text += "\n\n💅 По услугам:\n"
+        for svc_name, cnt in s["by_service"]:
+            text += f"  • {svc_name}: {cnt} шт.\n"
+    prev_month = month - 1 if month > 1 else 12
+    prev_year = year if month > 1 else year - 1
+    next_month = month + 1 if month < 12 else 1
+    next_year = year if month < 12 else year + 1
+    kb_rows = []
+    if not (next_year == now.year and next_month > now.month):
+        kb_rows.append([InlineKeyboardButton(text=f"{MONTHS[next_month]} ▶️", callback_data=f"stats_month:{next_year}:{next_month}")])
+    kb_rows.append([InlineKeyboardButton(text=f"◀️ {MONTHS[prev_month]}", callback_data=f"stats_month:{prev_year}:{prev_month}")])
+    kb_rows.append([InlineKeyboardButton(text="📊 За всё время", callback_data="stats_all")])
+    kb_rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")])
+    await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    await call.answer()
+
+@dp.callback_query(F.data == "stats_all")
+async def stats_all_handler(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS: await call.answer("⛔️", show_alert=True); return
+    try: s = get_stats_all()
+    except Exception as e: await call.answer(f"Ошибка: {e}", show_alert=True); return
+    text = "📊 За всё время\n\n"
+    text += f"📋 Всего записей: {s['total_bookings']}\n"
+    text += f"🗑 Отмен: {s['total_cancelled']} (клиент: {s['cancelled_by_client']}, мастер: {s['cancelled_by_master']})\n"
+    text += f"🔄 Переносов: {s['total_transfers']}\n"
+    text += f"⭐ Отзывов: {s['total_reviews']}"
+    if s["avg_rating"]: text += f" | {s['avg_rating']} ⭐"
+    text += f"\n💰 Общая выручка: {s['total_revenue']}€"
+    text += f"\n⭐ Чаевые за всё время: {s.get('tips_count',0)} раз | {s.get('tips_stars',0)} ⭐ ≈ {s.get('tips_eur',0.0)}€"
+    if s["by_service"]:
+        text += "\n\n💅 По услугам:\n"
+        for svc_name, cnt in s["by_service"]:
+            text += f"  • {svc_name}: {cnt} шт.\n"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]])
+    await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def admin_ban_menu(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS: await call.answer("⛔️", show_alert=True); return
+    banned = get_banned_users()
+    text = f"🚫 Бан пользователей\n\nЗабанено: {len(banned)} чел.\n\n"
+    kb_rows = [[InlineKeyboardButton(text="🚫 Забанить по @username", callback_data="ban_start")]]
+    if banned:
+        for b in banned[:10]:
+            uname = f"@{b['username']}" if b['username'] else f"id:{b['user_id']}"
+            kb_rows.append([InlineKeyboardButton(text=f"🔓 Разбанить {uname}", callback_data=f"unban:{b['user_id']}")])
+    kb_rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")])
+    await call.message.answer(text + ("Нет забаненных." if not banned else ""),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    await call.answer()
+
+@dp.callback_query(F.data == "ban_start")
+async def ban_start(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id not in ADMIN_IDS: await call.answer("⛔️", show_alert=True); return
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_ban_menu")]])
+    await call.message.answer("Введите @username пользователя для бана:", reply_markup=cancel_kb)
+    await state.set_state(BanUser.username)
+    await call.answer()
+
+@dp.message(BanUser.username)
+async def ban_by_username(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    username = message.text.strip().lstrip("@")
+    user = find_user_by_username(username)
+    if not user:
+        cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_ban_menu")]])
+        await message.answer(f"❌ Пользователь @{username} не найден в базе.\n\nВведите другой @username:", reply_markup=cancel_kb); return
+    await state.clear()
+    ban_user(user["user_id"], user["username"])
+    try: await bot.send_message(user["user_id"], "⛔️ Ваш доступ к боту ограничен.")
+    except: pass
+    await message.answer(
+        f"✅ Пользователь @{username} забанен.\nВсе его брони удалены.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ К бан-листу", callback_data="admin_ban_menu")]]))
+
+@dp.callback_query(F.data.startswith("unban:"))
+async def unban_user_handler(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS: await call.answer("⛔️", show_alert=True); return
+    user_id = int(call.data.split(":")[1])
+    unban_user(user_id)
+    try: await bot.send_message(user_id, "✅ Ваш доступ к боту восстановлен!")
+    except: pass
+    await call.answer("✅ Разбанен")
+    await admin_ban_menu(call)
+# ─────────────────────────────────────────────────────────────────────────────
+
 async def reminder_loop():
     while True:
         try:
@@ -1506,6 +2231,53 @@ async def reminder_loop():
                     try:
                         await bot.send_message(b["user_id"], f"😊 Как прошёл визит?\n\n💅 {b['service']}\n\nОставьте оценку 👇", reply_markup=review_rating_kb(b["id"]))
                         con2=db_connect(); con2.execute("UPDATE bookings SET review_sent=1 WHERE id=?", (b["id"],)); con2.commit(); con2.close()
+                    except: pass
+                hours_after = (now - end_appt).total_seconds() / 3600
+                if not b.get("rebooking_sent") and 23.5 <= hours_after <= 24.5:
+                    try:
+                        kb = InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="💅 Записаться снова", callback_data="main_menu")]])
+                        await bot.send_message(
+                            b["user_id"],
+                            f"💅 Привет, {b['name']}!\n\nПрошли сутки после вашего визита к Дарье 🌸\n\nНадеемся, что вам всё понравилось! Когда будете готовы — записывайтесь снова, мы всегда рады вас видеть 💕",
+                            reply_markup=kb)
+                        con2=db_connect(); con2.execute("UPDATE bookings SET rebooking_sent=1 WHERE id=?", (b["id"],)); con2.commit(); con2.close()
+                    except: pass
+                # После завершения услуги — выдаём ваучеры по рефералу если есть
+                if mins_after >= 5:
+                    try:
+                        con2=db_connect()
+                        # Проверяем есть ли реферал для этого пользователя где ваучер ещё не выдан
+                        ref_row = con2.execute(
+                            "SELECT id, referrer_id FROM referrals WHERE referred_id=? AND voucher_sent=0",
+                            (b["user_id"],)).fetchone()
+                        if ref_row:
+                            ref_db_id, referrer_id = ref_row
+                            # Выдаём ваучер пригласившему
+                            ref_code = create_voucher(referrer_id, 30)
+                            ref_count = get_referral_count(referrer_id)
+                            try:
+                                await bot.send_message(referrer_id,
+                                    f"🎀 Твоя подруга завершила первый визит к Дарье!\n\n"
+                                    f"Держи ваучер на скидку 30%:\n`{ref_code}`\n\n"
+                                    f"Всего приглашено: {ref_count} чел. Введи код при следующей записи 💕",
+                                    parse_mode="Markdown")
+                            except: pass
+                            # Выдаём ваучер новому клиенту
+                            new_code = create_voucher(b["user_id"], 30)
+                            try:
+                                await bot.send_message(b["user_id"],
+                                    f"🎀 Спасибо за первый визит к Дарье!\n\n"
+                                    f"Твой ваучер на скидку 30%:\n`{new_code}`\n\n"
+                                    f"Введи код при следующей записи 💅",
+                                    parse_mode="Markdown")
+                            except: pass
+                            # Отмечаем что ваучер выдан
+                            con2.execute("UPDATE referrals SET voucher_sent=1 WHERE id=?", (ref_db_id,))
+                            con2.commit()
+                        # Удаляем завершённую бронь
+                        con2.execute("DELETE FROM bookings WHERE id=?", (b["id"],))
+                        con2.commit(); con2.close()
                     except: pass
             if now.hour==8 and now.minute<5:
                 today_b=[b for b in rows_all if b["year"]==now.year and b["month"]==now.month and b["day"]==now.day]
